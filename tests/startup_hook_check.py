@@ -90,15 +90,15 @@ def bookkeeping():
     window.open(1, [], now=0)
     assert window.windows == 2 and window.unprotected == 1
 
-    # A second window while one is open is a bug in the caller, not a silent overwrite.
+    # A thread that was not held and steps while a window is open does not take the window over: the
+    # owner keeps it, the held threads stay held until the owner is done, and the window is exposed.
+    log, hold, release = fakes({3: FAILED})
     window = StepWindow(hold, release)
-    window.open(1, [], now=0)
-    try:
-        window.open(2, [], now=0)
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("a second window was opened")
+    window.open(1, [2, 3], now=0)
+    assert not window.defer(3), "a thread that is not held cannot be deferred"
+    window.open(3, [1, 2], now=0)
+    assert window.owner == 1 and window.unprotected == 1 and log["released"] == []
+    assert not window.finish(3) and window.finish(1) and log["released"] == [2]
 
     # The summary is always there, with zeros.
     line = StepWindow(hold, release).summary(0)

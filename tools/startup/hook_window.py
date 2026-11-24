@@ -25,9 +25,12 @@ class StepWindow:
 
     def open(self, owner, others, now):
         """The owner is about to step over its hook: hold every other thread first."""
-        if self.owner is not None:
-            raise RuntimeError("a step window is already open")
         self.windows += 1
+        if self.owner is not None:
+            # A thread that was not held (or reached another hook) steps while a window is open: the
+            # window stays with its owner and is reported as exposed.
+            self._expose()
+            return
         if not self.protect:  # measuring mode: nothing is held, every window with company is exposed
             self.unprotected += 1 if others else 0
             return
@@ -46,9 +49,9 @@ class StepWindow:
             self._expose()
 
     def defer(self, tid):
-        """True when a hook hit comes from a held thread: it trapped before it was held, so it
+        """True when a hook hit comes from a thread held by the open window: it trapped before it was held, so it
         must go back to the hook address and trap again once the window is closed."""
-        if self.owner is None or tid == self.owner:
+        if tid not in self._held:
             return False
         self.deferred += 1
         return True
