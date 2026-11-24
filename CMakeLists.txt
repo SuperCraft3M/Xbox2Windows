@@ -375,6 +375,23 @@ target_compile_features(startup_inflate_status PRIVATE cxx_std_17)
 target_include_directories(startup_inflate_status PRIVATE src)
 add_test(NAME startup_inflate_status COMMAND startup_inflate_status)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
+# The launcher's --map-drive option: a console package on another volume is opened through a
+# mapped letter. The consumer is source-built and the launcher rewrites its open.
+add_executable(startup_map_drive_consumer tests/startup_map_drive_consumer.cpp)
+target_compile_features(startup_map_drive_consumer PRIVATE cxx_std_17)
+add_test(NAME startup_map_drive COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
+    "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
+    "${CMAKE_CURRENT_BINARY_DIR}")
+set_tests_properties(startup_map_drive PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+# Two calls overlapping on the mapped letter. Expected to fail today: the launcher's entry hook is one
+# patched byte per function, so a thread that enters while another is being stepped over runs untraced
+# and its open keeps the unmapped name. Registered as WILL_FAIL so it is visible, documented, and
+# starts failing the suite once the hook stops dropping concurrent calls.
+add_test(NAME startup_map_drive_overlap COMMAND "${INTAKE_PYTHON}" -B
+    "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
+    "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
+    "${CMAKE_CURRENT_BINARY_DIR}" overlap)
+set_tests_properties(startup_map_drive_overlap PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77 WILL_FAIL TRUE)
 target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
 # APU heap stand-in: ApuFree reuse, coalescing, refused requests and concurrent callers (docs/startup-runtime.md).
 add_executable(startup_acphal_apu_free tests/startup_acphal_apu_free.cpp)

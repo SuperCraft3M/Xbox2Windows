@@ -244,6 +244,97 @@ def main():
         text = ustr(name) if name else ""
         return (f"[root {root:#x}]" if root else "") + text
 
+    def oa_string(addr):  # the UNICODE_STRING* inside OBJECT_ATTRIBUTES, for rewriting it
+        raw = read(addr, 24)
+        return struct.unpack_from("<Q", raw, 16)[0] if len(raw) >= 24 else 0
+
+    # --map-drive G=C:\folder[;S=D:\folder]: a console executable opens its package at a fixed drive
+    # letter, so a package that sits on another volume never mounts. The file hooks rewrite the path
+    # of an open on a mapped letter to the real folder, in the caller's own UNICODE_STRING.
+    drive_map = {}
+    # Rewritten names live in buffers borrowed for the duration of one hooked call, so two calls that
+    # overlap on different threads cannot overwrite or free each other's name. A buffer goes back to
+    # the pool when that call's name is restored, so a serial run reuses one buffer instead of
+    # allocating per open and the allocation count does not follow the number of opens.
+    name_pool = {"free": [], "allocations": 0}
+    for item in filter(None, opts.get("--map-drive", "").split(";")):
+        letter, _, folder = item.partition("=")
+        letter = letter.strip().rstrip(":").upper()
+        # Letters are ASCII A-Z: isalpha() alone also accepts non-ASCII letters, which no NT path has.
+        if len(letter) == 1 and letter.isascii() and letter.isalpha() and folder.strip():
+            # NT paths take backslashes; the option may arrive with either separator.
+            drive_map[letter] = folder.strip().rstrip("\\/").replace("/", "\\")
+
+    def map_drive(text, string_address):
+        """Makes the call's name temporary: returns (new text, restore) or (None, None).
+
+        The caller's UNICODE_STRING is changed only for the duration of the hooked call; restore()
+        puts back its length, buffer pointer and contents when the call returns."""
+        if not drive_map or not string_address:
+            return None, None
+        body = text
+        # oa_name() marks a root-relative name with a "[root 0x...]" tag for the log. That tag is not
+        # part of the name, so it is dropped here and never written into the caller's UNICODE_STRING.
+        if body.startswith("[root ") and "]" in body:
+            body = body[body.index("]") + 1:]
+        prefix = ""
+        for candidate in ("\\??\\", "\\\\.\\", "\\\\?\\"):
+            if body.upper().startswith(candidate):
+                prefix, body = body[:len(candidate)], body[len(candidate):]
+                break
+        if len(body) < 2 or body[1] != ":" or body[0].upper() not in drive_map:
+            return None, None
+        replacement = prefix + drive_map[body[0].upper()] + body[2:]
+        raw = read(string_address, 16)
+        if len(raw) < 16:
+            return None, None
+        _, maximum, buffer = struct.unpack_from("<HH4xQ", raw)
+        encoded = replacement.encode("utf-16-le")
+        # A UNICODE_STRING length is a USHORT, so a longer name cannot be expressed at all.
+        if not 0 < len(encoded) <= 0xFFFF:
+            return None, None
+        if len(encoded) <= maximum:
+            original = read(buffer, len(encoded))
+            if len(original) != len(encoded) or not write(buffer, encoded):
+                return None, None
+            if not write(string_address, struct.pack("<H", len(encoded))):
+                write(buffer, original)
+                return None, None
+            return replacement, lambda: (write(buffer, original), write(string_address, raw))
+        # The replacement is longer than the caller's buffer, which is the common case: a folder path
+        # against a single letter. Borrow a buffer from the pool for this call only; it is returned
+        # when the name is restored, so serial opens reuse one buffer but overlapping calls get their
+        # own.
+        address, capacity = 0, 0
+        for index, (candidate, room) in enumerate(name_pool["free"]):
+            if room >= len(encoded):
+                address, capacity = name_pool["free"].pop(index)
+                break
+        if not address:
+            k32.VirtualAllocEx.restype = ctypes.c_void_p
+            k32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+            fresh = k32.VirtualAllocEx(wt.HANDLE(pi.hProcess), None, len(encoded), 0x3000, 0x04)
+            if not fresh:
+                return None, None
+            address, capacity = fresh, len(encoded)
+            name_pool["allocations"] += 1
+            if file_log:
+                file_log.write(f"{time.time() - start:7.3f} NAMEBUF alloc {len(encoded)} bytes at {fresh:#x} "
+                               f"(live {name_pool['allocations']})\n")
+                file_log.flush()
+        if not write(address, encoded):
+            name_pool["free"].append((address, capacity))
+            return None, None
+        if not write(string_address, struct.pack("<HH4xQ", len(encoded), len(encoded), address)):
+            name_pool["free"].append((address, capacity))
+            return None, None
+
+        def restore():
+            write(string_address, raw)
+            name_pool["free"].append((address, capacity))
+
+        return replacement, restore
+
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
     k32.GetModuleHandleW.restype = wt.HMODULE
     ntdll = k32.GetModuleHandleW("ntdll.dll")
@@ -351,7 +442,11 @@ def main():
         rsp = regs["Rsp"]
         if addr in hooks:
             name, arg = hooks[addr]
-            ret = read_qword(read, rsp) or 0
+            ret = struct.unpack("<Q", read(rsp, 8) or b"\0" * 8)[0]
+            # Every kind of trace reaches the common "if desc:" below, so the restore callback is
+            # initialised here: leaving it to the file-name branch would let a non-name trace see an
+            # unbound name or carry over the previous call's callback.
+            restore = None
             if arg == "valloc":
                 # NtAllocateVirtualMemory(process, &base, zero bits, &size, type, protect) and
                 # NtAllocateVirtualMemoryEx(process, &base, &size, type, protect, ...).
@@ -399,10 +494,29 @@ def main():
                 desc = bink_call(name, regs, ret)
             else:
                 if arg.startswith("ustr:"):
-                    target = ustr(regs[arg[5:].capitalize()])
+                    string_address = regs[arg[5:].capitalize()]
+                    target = ustr(string_address)
                 else:
-                    target = oa_name(regs[arg.capitalize()] if arg != 'r8' else regs['R8'])
-                desc = f"{name} {target} from {where(ret)}"
+                    oa_address = regs['R8'] if arg == 'r8' else regs[arg.capitalize()]
+                    target = oa_name(oa_address)
+                    string_address = oa_string(oa_address)
+                if offline and any(pattern in target.lower() for pattern in OFFLINE_DENY):
+                    # Offline mode: the call never runs, so the caller's name is left untouched.
+                    denied[target] = denied.get(target, 0) + 1
+                    file_log.write(f"{time.time() - start:7.3f} DENIED (offline) {name} {target} "
+                                   f"from {where(ret)}\n")
+                    file_log.flush()
+                    struct.pack_into("<Q", ctx, 0x78, 0xC0000022)   # rax
+                    struct.pack_into("<Q", ctx, 0x98, rsp + 8)      # rsp: pop the return address
+                    struct.pack_into("<Q", ctx, 0xF8, ret)          # rip
+                    set_ctx(thread)
+                    return True
+                mapped, restore = map_drive(target, string_address)
+                desc = f"{name} {mapped or target} from {where(ret)}"
+                if mapped:
+                    desc += " (mapped from " + target + ")"
+                    file_log.write(f"{time.time() - start:7.3f} MAP {target} -> {mapped}\n")
+                    file_log.flush()
                 if offline and any(pattern in target.lower() for pattern in OFFLINE_DENY):
                     # Offline mode: the call never runs. Return STATUS_ACCESS_DENIED to the caller.
                     denied[target] = denied.get(target, 0) + 1
@@ -420,11 +534,15 @@ def main():
                 chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                 desc += " callers: " + " ".join(chain[:8])
             if desc:
-                returns.setdefault(ret, []).append((tid, rsp + 8, desc))
+                returns.setdefault(ret, []).append((tid, rsp + 8, desc, restore))
                 arm(ret)
         for item in list(returns.get(addr, [])):
             if item[0] == tid and item[1] == rsp:
                 returns[addr].remove(item)
+                # The name is temporary: the caller gets its own UNICODE_STRING back before anything
+                # else runs, so a failure or a retry sees the name it built.
+                if item[3]:
+                    item[3]()
                 file_log.write(f"{time.time() - start:7.3f} {item[2]} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
                 file_log.flush()
         # Step over the original instruction, then re-arm.

@@ -20,6 +20,7 @@ param(
     [int]$MemoryGiB = 14,
     [int]$ContinueAsserts = 0,                 # main-image int3s to log and step over (title soft asserts)
     [string]$InputScript = "",                 # X2W_INPUT_SCRIPT, e.g. "4@70" = A at 70 s
+    [string]$MapDrive = "",                    # e.g. "G=D:\package": rewrite opens on a console letter
     [string]$StoragePath = "",                 # X2W_STORAGE_PATH: persistent local storage root (a trailing \ is added when missing)
     [string]$ShaderCache = "out/startup/shader_cache",
     [switch]$Render,                           # draw through translated pipelines
@@ -52,6 +53,8 @@ if ($Render) {
     $env:X2W_SHADER_CACHE = (Resolve-Path $ShaderCache).Path
 }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
+$mapArgs = @()
+if ($MapDrive) { $mapArgs = @("--map-drive", $MapDrive) }
 python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-    --trace-files 1 --continue-asserts $ContinueAsserts *> "$LogDir.out"
+    --trace-files 1 --continue-asserts $ContinueAsserts @mapArgs *> "$LogDir.out"
 Get-Content "$LogDir.out" -TotalCount 5
