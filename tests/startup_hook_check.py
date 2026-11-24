@@ -20,7 +20,7 @@ import tempfile
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools/startup"
 sys.path.insert(0, str(TOOLS))
-from hook_window import FAILED, GONE, HELD, ReturnBook, StepWindow  # noqa: E402
+from hook_window import FAILED, GONE, HELD, STILL_ACTIVE, ReturnBook, StepWindow, classify_hold  # noqa: E402
 
 NAME = "x2w_hook_overlap.dat"
 OPENS = 64
@@ -101,10 +101,30 @@ def bookkeeping():
     assert not window.finish(3) and window.finish(1) and log["released"] == [2]
 
     returns_bookkeeping()
+    hold_outcomes()
 
     # The summary is always there, with zeros.
     line = StepWindow(hold, release).summary(0)
     assert line == "hook windows: entries=0 windows=0 unprotected=0 deferred=0 timeouts=0 protection=on", line
+
+
+def hold_outcomes():
+    """A thread that called ExitThread but whose EXIT_THREAD event is not read yet cannot be suspended
+    (access denied). It runs no code, so it is GONE; the same failure on a live thread is FAILED."""
+    access_denied = 5
+    assert classify_hold(0, signaled=False) == GONE, "exited with code 0"
+    assert classify_hold(STILL_ACTIVE + 1) == GONE
+    assert classify_hold(STILL_ACTIVE, signaled=True) == GONE, "exit code not stored yet, handle signaled"
+    assert classify_hold(None, error=87) == GONE, "no such thread"
+    assert classify_hold(STILL_ACTIVE) == FAILED, "alive and not suspendable: a real hole"
+    assert classify_hold(None, error=access_denied) == FAILED, "exit code unknown: not assumed gone"
+    # The window counts a gone thread as nothing and a live unsuspendable one as unprotected.
+    for outcome, unprotected in ((classify_hold(0), 0), (classify_hold(STILL_ACTIVE), 1)):
+        log, hold, release = fakes({2: outcome})
+        window = StepWindow(hold, release)
+        window.open(1, [2, 3], now=0)
+        assert window.unprotected == unprotected and log["held"] == [3]
+        window.finish(1)
 
 
 def traced_returns(retrapped):

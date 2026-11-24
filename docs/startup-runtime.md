@@ -256,7 +256,7 @@ keyed by thread id, not shared.
 
 Every run ends with `hook windows: entries=N windows=W unprotected=U deferred=D timeouts=T protection=on|off` in the
 console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` counts the windows in which another thread could
-not be held, or the deadline passed, or protection was off with other threads alive: an upper bound on the calls a run may have
+not be held (a thread that has already exited is not counted: it runs no code), or the deadline passed, or protection was off with other threads alive: an upper bound on the calls a run may have
 missed. `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
 
 `tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no

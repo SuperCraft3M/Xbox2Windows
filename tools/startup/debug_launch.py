@@ -21,7 +21,7 @@ k32.SuspendThread.restype = wt.DWORD
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
-from hook_window import StepWindow, ReturnBook, HELD, GONE, FAILED  # noqa: E402
+from hook_window import StepWindow, ReturnBook, classify_hold, HELD  # noqa: E402
 
 EXCEPTION, CREATE_THREAD, CREATE_PROCESS, EXIT_THREAD, EXIT_PROCESS, LOAD_DLL, UNLOAD_DLL, OUTPUT_STRING, RIP = range(1, 10)
 DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED = 0x00010002, 0x80010001
@@ -342,18 +342,26 @@ def main():
     sync_addr = (ctypes.addressof(sync_raw) + 15) & ~15
 
     def hold_thread(tid):
-        handle = k32.OpenThread(0x0002 | 0x0008, False, tid)  # SUSPEND_RESUME | GET_CONTEXT
+        # SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION | SYNCHRONIZE
+        handle = k32.OpenThread(0x0002 | 0x0008 | 0x0040 | 0x00100000, False, tid)
         if not handle:
-            return GONE if ctypes.get_last_error() == 87 else FAILED  # 87: no such thread
+            return classify_hold(None, ctypes.get_last_error())
         # SuspendThread returns before the thread has stopped; GetThreadContext waits until it has.
         struct.pack_into("<I", (ctypes.c_ubyte * 1232).from_address(sync_addr), 0x30, 0x100001)
-        if (k32.SuspendThread(wt.HANDLE(handle)) == 0xFFFFFFFF
-                or not k32.GetThreadContext(wt.HANDLE(handle), ctypes.c_void_p(sync_addr))):
+        suspended = k32.SuspendThread(wt.HANDLE(handle)) != 0xFFFFFFFF
+        if suspended and k32.GetThreadContext(wt.HANDLE(handle), ctypes.c_void_p(sync_addr)):
+            held_threads[tid] = handle
+            return HELD
+        if suspended:
             k32.ResumeThread(wt.HANDLE(handle))
-            k32.CloseHandle(wt.HANDLE(handle))
-            return FAILED
-        held_threads[tid] = handle
-        return HELD
+        # Classify after the failure: a thread that has called ExitThread is GONE (no code left to race
+        # with); a live thread that cannot be suspended stays FAILED and the window reports it.
+        code = wt.DWORD()
+        exit_code = code.value if k32.GetExitCodeThread(wt.HANDLE(handle), ctypes.byref(code)) else None
+        # A thread that is terminating may not have its exit code yet: its handle is signaled in moments.
+        signaled = k32.WaitForSingleObject(wt.HANDLE(handle), 20) == 0
+        k32.CloseHandle(wt.HANDLE(handle))
+        return classify_hold(exit_code, signaled=signaled)
 
     def release_thread(tid):
         handle = held_threads.pop(tid, None)

@@ -11,6 +11,24 @@ are always reported so a run says how many calls it may have missed.
 """
 
 HELD, GONE, FAILED = "held", "gone", "failed"
+ERROR_INVALID_PARAMETER = 87  # OpenThread: no thread has this id
+STILL_ACTIVE = 259  # GetExitCodeThread of a thread that has not exited
+
+
+def classify_hold(exit_code, error=0, signaled=False):
+    """Outcome of a hold that did not take: GONE when the thread has exited, FAILED when it is alive.
+
+    A thread that called ExitThread stays in the debugger's thread list until its EXIT_THREAD event is
+    read, and by then OpenThread still works but SuspendThread and GetThreadContext fail (access
+    denied). That thread runs no more code, so nothing can race with it: GONE. A live thread that
+    cannot be suspended is a real hole in the window and stays FAILED. `exit_code` is
+    GetExitCodeThread (None when it could not be read), `signaled` whether the thread handle is
+    already signaled, `error` the GetLastError of an OpenThread that returned no handle."""
+    if error == ERROR_INVALID_PARAMETER:
+        return GONE
+    if signaled or (exit_code is not None and exit_code != STILL_ACTIVE):
+        return GONE
+    return FAILED
 
 
 class ReturnBook:
