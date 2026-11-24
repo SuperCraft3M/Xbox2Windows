@@ -18,10 +18,12 @@ k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
 k32.SuspendThread.restype = wt.DWORD
+ntdll = ctypes.WinDLL("ntdll")
+ntdll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
-from hook_window import StepWindow, ReturnBook, classify_hold, HELD  # noqa: E402
+from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
 EXCEPTION, CREATE_THREAD, CREATE_PROCESS, EXIT_THREAD, EXIT_PROCESS, LOAD_DLL, UNLOAD_DLL, OUTPUT_STRING, RIP = range(1, 10)
 DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED = 0x00010002, 0x80010001
@@ -338,36 +340,53 @@ def main():
     stepping = {}  # tid -> addr to re-arm
     hook_entries = [0]
     held_threads = {}  # tid -> handle of a thread held for the current step window
+    os_handles = {}  # tid -> hThread of CREATE_*_DEBUG_EVENT: valid until its EXIT_THREAD is continued; never closed here
     sync_raw = (ctypes.c_ubyte * (1232 + 16))()
     sync_addr = (ctypes.addressof(sync_raw) + 15) & ~15
 
     def hold_thread(tid):
-        # SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION | SYNCHRONIZE
-        handle = k32.OpenThread(0x0002 | 0x0008 | 0x0040 | 0x00100000, False, tid)
-        if not handle:
-            return classify_hold(None, ctypes.get_last_error())
+        handle = os_handles.get(tid)
+        owned = handle is None
+        if owned:  # SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION | SYNCHRONIZE
+            handle = k32.OpenThread(0x0002 | 0x0008 | 0x0040 | 0x00100000, False, tid)
+            if not handle:
+                return classify_hold(None, ctypes.get_last_error())
+
+        def drop():
+            if owned:
+                k32.CloseHandle(wt.HANDLE(handle))
+
         # SuspendThread returns before the thread has stopped; GetThreadContext waits until it has.
         struct.pack_into("<I", (ctypes.c_ubyte * 1232).from_address(sync_addr), 0x30, 0x100001)
-        suspended = k32.SuspendThread(wt.HANDLE(handle)) != 0xFFFFFFFF
+        previous = wt.ULONG()
+        status = ntdll.NtSuspendThread(wt.HANDLE(handle), ctypes.byref(previous))
+        suspended = status == 0
         if suspended and k32.GetThreadContext(wt.HANDLE(handle), ctypes.c_void_p(sync_addr)):
-            held_threads[tid] = handle
+            held_threads[tid] = (handle, owned)
             return HELD
         if suspended:
             k32.ResumeThread(wt.HANDLE(handle))
+        # A thread already exiting (waiting for its EXIT_THREAD event) refuses suspension with
+        # STATUS_THREAD_IS_TERMINATING while GetExitCodeThread still says STILL_ACTIVE: it runs no code.
+        if not suspended and classify_status(status) == GONE:
+            drop()
+            return GONE
         # Classify after the failure: a thread that has called ExitThread is GONE (no code left to race
         # with); a live thread that cannot be suspended stays FAILED and the window reports it.
         code = wt.DWORD()
         exit_code = code.value if k32.GetExitCodeThread(wt.HANDLE(handle), ctypes.byref(code)) else None
         # A thread that is terminating may not have its exit code yet: its handle is signaled in moments.
         signaled = k32.WaitForSingleObject(wt.HANDLE(handle), 20) == 0
-        k32.CloseHandle(wt.HANDLE(handle))
+        drop()
         return classify_hold(exit_code, signaled=signaled)
 
     def release_thread(tid):
-        handle = held_threads.pop(tid, None)
-        if handle:
+        held = held_threads.pop(tid, None)
+        if held:
+            handle, owned = held
             k32.ResumeThread(wt.HANDLE(handle))
-            k32.CloseHandle(wt.HANDLE(handle))
+            if owned:
+                k32.CloseHandle(wt.HANDLE(handle))
 
     # A hook step-over restores the original byte for one instruction. Every other thread is held
     # for that step (--suspend-others 0 turns this off to measure what the window costs).
@@ -557,7 +576,9 @@ def main():
         status = DBG_CONTINUE
         if code == CREATE_PROCESS:
             live_threads.add(tid)
-            h_file, _, _, base = struct.unpack_from("<QQQQ", event, 16)
+            h_file, _, h_thread, base = struct.unpack_from("<QQQQ", event, 16)
+            if h_thread:
+                os_handles[tid] = h_thread
             main_base = base
             for item in filter(None, os.environ.get("X2W_COUNT", "").split(",")):
                 hooks[base + int(item, 16)] = (f"+{item}", "count")
@@ -603,10 +624,14 @@ def main():
         elif code == CREATE_THREAD:
             log(f"{time.time() - start:7.3f} thread {tid} created")
             live_threads.add(tid)
+            h_thread = struct.unpack_from("<Q", event, 16)[0]
+            if h_thread:
+                os_handles[tid] = h_thread
             window.hold(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
             window.finish(tid)
+            os_handles.pop(tid, None)
         elif code == EXIT_PROCESS:
             exit_code = struct.unpack_from("<I", event, 16)[0]
             log(f"{time.time() - start:7.3f} exit {exit_code:#010x}")

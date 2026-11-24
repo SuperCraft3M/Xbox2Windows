@@ -20,7 +20,7 @@ import tempfile
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools/startup"
 sys.path.insert(0, str(TOOLS))
-from hook_window import FAILED, GONE, HELD, STILL_ACTIVE, ReturnBook, StepWindow, classify_hold  # noqa: E402
+from hook_window import FAILED, GONE, HELD, STILL_ACTIVE, STATUS_INVALID_HANDLE, STATUS_THREAD_IS_TERMINATING, ReturnBook, StepWindow, classify_hold, classify_status  # noqa: E402
 
 NAME = "x2w_hook_overlap.dat"
 OPENS = 64
@@ -118,8 +118,12 @@ def hold_outcomes():
     assert classify_hold(None, error=87) == GONE, "no such thread"
     assert classify_hold(STILL_ACTIVE) == FAILED, "alive and not suspendable: a real hole"
     assert classify_hold(None, error=access_denied) == FAILED, "exit code unknown: not assumed gone"
+    assert classify_status(STATUS_THREAD_IS_TERMINATING) == GONE, "exiting thread, exit code still 259"
+    assert classify_status(STATUS_INVALID_HANDLE) == GONE
+    assert classify_status(0xC0000022) == FAILED, "access denied: not assumed gone"
     # The window counts a gone thread as nothing and a live unsuspendable one as unprotected.
-    for outcome, unprotected in ((classify_hold(0), 0), (classify_hold(STILL_ACTIVE), 1)):
+    for outcome, unprotected in ((classify_hold(0), 0), (classify_status(STATUS_THREAD_IS_TERMINATING), 0),
+                                 (classify_hold(STILL_ACTIVE), 1)):
         log, hold, release = fakes({2: outcome})
         window = StepWindow(hold, release)
         window.open(1, [2, 3], now=0)

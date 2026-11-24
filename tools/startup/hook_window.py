@@ -13,6 +13,13 @@ are always reported so a run says how many calls it may have missed.
 HELD, GONE, FAILED = "held", "gone", "failed"
 ERROR_INVALID_PARAMETER = 87  # OpenThread: no thread has this id
 STILL_ACTIVE = 259  # GetExitCodeThread of a thread that has not exited
+STATUS_INVALID_HANDLE = 0xC0000008
+STATUS_THREAD_IS_TERMINATING = 0xC000004B  # NtSuspendThread: the thread is exiting and runs no more code
+
+
+def classify_status(status):
+    """GONE for an NtSuspendThread status that says the thread cannot run again, else FAILED."""
+    return GONE if status in (STATUS_THREAD_IS_TERMINATING, STATUS_INVALID_HANDLE) else FAILED
 
 
 def classify_hold(exit_code, error=0, signaled=False):
