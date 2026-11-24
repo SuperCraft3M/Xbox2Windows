@@ -243,6 +243,32 @@ cmake --build --preset dev --target startup_local_log_check
 ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
 ```
 
+## Concurrent calls through a hooked function
+
+The debugger's file, socket and allocation hooks are one patched byte per function. To run the original
+instruction it restores the byte, single-steps the thread that hit it and patches the byte again. A second thread that
+entered the function inside that window ran untraced, so `files.txt` could miss opens and the
+offline mode could miss a refused socket. Now every other thread is held for the step and resumes when the stepping
+thread is done (`tools/startup/hook_window.py`). A thread that had already trapped when it was held goes back to the
+hook address and traps again afterwards, so its call is traced once, not twice. Each window has a 2 s deadline, so a
+thread is never held forever. Per-thread state of a call in flight (the return address and stack pointer it will come back to) is
+keyed by thread id, not shared.
+
+Every run ends with `hook windows: entries=N windows=W unprotected=U deferred=D timeouts=T protection=on|off` in the
+console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` counts the windows in which another thread could
+not be held, or the deadline passed, or protection was off with other threads alive: an upper bound on the calls a run may have
+missed. `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
+
+`tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no
+Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: two threads
+enter `CreateFileW` together 32 times each on one file, and all 64 opens must show in `files.txt` with their result and
+`unprotected=0`. The control, `--suspend-others 0`, must lose opens and report `unprotected` above 0.
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
