@@ -260,8 +260,8 @@ not be held, or the deadline passed, or protection was off with other threads al
 missed. `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
 
 `tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no
-Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: two threads
-enter `CreateFileW` together 32 times each on one file, and all 64 opens must show in `files.txt` with their result and
+Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: four threads
+enter `CreateFileW` together 16 times each on one file, and all 64 opens must show in `files.txt` with their result and
 `unprotected=0`. The control, `--suspend-others 0`, must lose opens and report `unprotected` above 0.
 
 ```powershell

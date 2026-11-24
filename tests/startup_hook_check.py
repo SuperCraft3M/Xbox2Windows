@@ -20,7 +20,7 @@ import tempfile
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools/startup"
 sys.path.insert(0, str(TOOLS))
-from hook_window import FAILED, GONE, HELD, StepWindow  # noqa: E402
+from hook_window import FAILED, GONE, HELD, ReturnBook, StepWindow  # noqa: E402
 
 NAME = "x2w_hook_overlap.dat"
 OPENS = 64
@@ -100,9 +100,38 @@ def bookkeeping():
     assert window.owner == 1 and window.unprotected == 1 and log["released"] == []
     assert not window.finish(3) and window.finish(1) and log["released"] == [2]
 
+    returns_bookkeeping()
+
     # The summary is always there, with zeros.
     line = StepWindow(hold, release).summary(0)
     assert line == "hook windows: entries=0 windows=0 unprotected=0 deferred=0 timeouts=0 protection=on", line
+
+
+def traced_returns(retrapped):
+    """Two threads call from fixed stack slots, 32 calls each. A call in `retrapped` hits its entry
+    hook twice: another thread re-patched the byte before this one ran the original instruction, so
+    the same call is registered again. Returns how many lines the book writes for the 64 calls."""
+    book, lines = ReturnBook(), 0
+    for call in range(32):
+        for tid in (1, 2):
+            for _ in range(2 if (call, tid) in retrapped else 1):
+                book.add(0x7000, tid, 0x1000 * tid, f"NtCreateFile call {call}")
+            lines += len(book.take(0x7000, tid, 0x1000 * tid))
+    return lines
+
+
+def returns_bookkeeping():
+    # One call is traced once however many times its entry trapped: a run showed "88 of 64".
+    retrapped = {(call, 1) for call in range(0, 32, 4)} | {(call, 2) for call in range(0, 32, 4)} \
+        | {(call, 1) for call in range(1, 32, 4)}
+    assert len(retrapped) == 24
+    assert traced_returns(set()) == 64
+    assert traced_returns(retrapped) == 64, traced_returns(retrapped)
+    book = ReturnBook()
+    book.add(0x10, 1, 0x100, "a")
+    book.add(0x10, 2, 0x100, "b")  # same slot value on another thread is another call
+    assert book.take(0x10, 1, 0x100) == ["a"] and book.take(0x10, 1, 0x100) == []
+    assert book.take(0x10, 2, 0x100) == ["b"] and book.take(0x99, 2, 0x100) == []
 
 
 def run(probe, scratch, name, options):
@@ -128,7 +157,7 @@ def launcher(probe, scratch):
     for attempt in range(3):
         traced, stdout, (windows, unprotected, timeouts), protection = run(probe, scratch, f"held{attempt}", [])
         assert "overlap opens 64 of 64" in stdout, stdout
-        assert traced == OPENS, f"attempt {attempt}: {traced} of {OPENS} opens traced"
+        assert traced == OPENS, f"attempt {attempt}: {traced} of {OPENS} opens traced (more than made means double counting)"
         assert windows >= OPENS and unprotected == 0 and timeouts == 0 and protection == "on", (windows, unprotected, timeouts)
     # Control: without holding the other thread the same run loses opens, and the report says so.
     for attempt in range(8):
@@ -136,9 +165,11 @@ def launcher(probe, scratch):
                                                                           ["--suspend-others", "0"])
         assert "overlap opens 64 of 64" in stdout, stdout
         assert protection == "off"
-        if traced < OPENS:
+        assert traced <= OPENS, f"control attempt {attempt}: {traced} traces for {OPENS} opens: a call was counted twice"
+        lost = max(0, OPENS - traced)
+        if lost:
             assert unprotected > 0, "opens were lost but the run reported no unprotected window"
-            return traced
+            return lost
     raise AssertionError(f"the control never lost an open in 8 runs: the overlap was not exercised ({traced} of {OPENS})")
 
 
@@ -149,4 +180,4 @@ if __name__ == "__main__":
         sys.exit(0)
     with tempfile.TemporaryDirectory() as temporary:
         lost = launcher(Path(sys.argv[1]).resolve(), Path(temporary))
-    print(f"startup_hook_overlap: PASS ({OPENS} of {OPENS} opens traced with the window; control traced {lost})")
+    print(f"startup_hook_overlap: PASS ({OPENS} of {OPENS} opens traced with the window; control lost {lost})")

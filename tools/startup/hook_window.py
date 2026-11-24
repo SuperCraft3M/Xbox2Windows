@@ -13,6 +13,32 @@ are always reported so a run says how many calls it may have missed.
 HELD, GONE, FAILED = "held", "gone", "failed"
 
 
+class ReturnBook:
+    """Pending hooked calls, keyed by return address; each is traced once, when its call returns.
+
+    A call is identified by its thread and the stack slot of its return address. The entry hook can
+    trap twice for one call when protection is off: another thread re-patches the byte before this
+    one has run the original instruction, so the thread traps again at the same address and slot.
+    That is the same call, so it replaces the first registration; two entries made the return write
+    two lines and a run counted 88 opens for 64 made."""
+
+    def __init__(self):
+        self._pending = {}  # return address -> list of (tid, stack slot, description)
+
+    def add(self, address, tid, slot, description):
+        kept = [item for item in self._pending.get(address, []) if (item[0], item[1]) != (tid, slot)]
+        kept.append((tid, slot, description))
+        self._pending[address] = kept
+
+    def take(self, address, tid, slot):
+        """Descriptions of the call that returns here on this thread and slot (at most one)."""
+        items = self._pending.get(address, [])
+        done = [item[2] for item in items if (item[0], item[1]) == (tid, slot)]
+        if done:
+            self._pending[address] = [item for item in items if (item[0], item[1]) != (tid, slot)]
+        return done
+
+
 class StepWindow:
     def __init__(self, hold, release, protect=True, limit=2.0):
         self._hold, self._release = hold, release  # hold(tid) -> HELD | GONE | FAILED; release(tid)

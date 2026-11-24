@@ -21,7 +21,7 @@ k32.SuspendThread.restype = wt.DWORD
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
-from hook_window import StepWindow, HELD, GONE, FAILED  # noqa: E402
+from hook_window import StepWindow, ReturnBook, HELD, GONE, FAILED  # noqa: E402
 
 EXCEPTION, CREATE_THREAD, CREATE_PROCESS, EXIT_THREAD, EXIT_PROCESS, LOAD_DLL, UNLOAD_DLL, OUTPUT_STRING, RIP = range(1, 10)
 DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED = 0x00010002, 0x80010001
@@ -334,7 +334,7 @@ def main():
         print(f"  bink luma plane -> bink_luma.png (pointer {pointer:#x}, pitch {pitch})")
 
     breakpoints = {}  # addr -> original byte
-    returns = {}  # addr -> list of (tid, rsp after return, description)
+    returns = ReturnBook()
     stepping = {}  # tid -> addr to re-arm
     hook_entries = [0]
     held_threads = {}  # tid -> handle of a thread held for the current step window
@@ -457,13 +457,11 @@ def main():
                 chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                 desc += " callers: " + " ".join(chain[:8])
             if desc:
-                returns.setdefault(ret, []).append((tid, rsp + 8, desc))
+                returns.add(ret, tid, rsp + 8, desc)
                 arm(ret)
-        for item in list(returns.get(addr, [])):
-            if item[0] == tid and item[1] == rsp:
-                returns[addr].remove(item)
-                file_log.write(f"{time.time() - start:7.3f} {item[2]} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
-                file_log.flush()
+        for description in returns.take(addr, tid, rsp):
+            file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
+            file_log.flush()
         # Step over the original instruction, then re-arm. Everyone else is held until the step is done.
         window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<Q", ctx, 0xF8, addr)
