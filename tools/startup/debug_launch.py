@@ -1,6 +1,6 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
-usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1]
+usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--suspend-others 0]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
@@ -17,9 +17,13 @@ k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
+k32.SuspendThread.restype = wt.DWORD
+nt_dll = ctypes.WinDLL("ntdll")
+nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
+from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
 EXCEPTION, CREATE_THREAD, CREATE_PROCESS, EXIT_THREAD, EXIT_PROCESS, LOAD_DLL, UNLOAD_DLL, OUTPUT_STRING, RIP = range(1, 10)
 DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED = 0x00010002, 0x80010001
@@ -423,8 +427,61 @@ def main():
         print(f"  bink luma plane -> bink_luma.png (pointer {pointer:#x}, pitch {pitch})")
 
     breakpoints = {}  # addr -> original byte
-    returns = {}  # addr -> list of (tid, rsp after return, description)
+    returns = ReturnBook()
     stepping = {}  # tid -> addr to re-arm
+    hook_entries = [0]
+    held_threads = {}  # tid -> handle of a thread held for the current step window
+    os_handles = {}  # tid -> hThread of CREATE_*_DEBUG_EVENT: valid until its EXIT_THREAD is continued; never closed here
+    sync_raw = (ctypes.c_ubyte * (1232 + 16))()
+    sync_addr = (ctypes.addressof(sync_raw) + 15) & ~15
+
+    def hold_thread(tid):
+        handle = os_handles.get(tid)
+        owned = handle is None
+        if owned:  # SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION | SYNCHRONIZE
+            handle = k32.OpenThread(0x0002 | 0x0008 | 0x0040 | 0x00100000, False, tid)
+            if not handle:
+                return classify_hold(None, ctypes.get_last_error())
+
+        def drop():
+            if owned:
+                k32.CloseHandle(wt.HANDLE(handle))
+
+        # SuspendThread returns before the thread has stopped; GetThreadContext waits until it has.
+        struct.pack_into("<I", (ctypes.c_ubyte * 1232).from_address(sync_addr), 0x30, 0x100001)
+        previous = wt.ULONG()
+        status = nt_dll.NtSuspendThread(wt.HANDLE(handle), ctypes.byref(previous))
+        suspended = status == 0
+        if suspended and k32.GetThreadContext(wt.HANDLE(handle), ctypes.c_void_p(sync_addr)):
+            held_threads[tid] = (handle, owned)
+            return HELD
+        if suspended:
+            k32.ResumeThread(wt.HANDLE(handle))
+        # A thread already exiting (waiting for its EXIT_THREAD event) refuses suspension with
+        # STATUS_THREAD_IS_TERMINATING while GetExitCodeThread still says STILL_ACTIVE: it runs no code.
+        if not suspended and classify_status(status) == GONE:
+            drop()
+            return GONE
+        # Classify after the failure: a thread that has called ExitThread is GONE (no code left to race
+        # with); a live thread that cannot be suspended stays FAILED and the window reports it.
+        code = wt.DWORD()
+        exit_code = code.value if k32.GetExitCodeThread(wt.HANDLE(handle), ctypes.byref(code)) else None
+        # A thread that is terminating may not have its exit code yet: its handle is signaled in moments.
+        signaled = k32.WaitForSingleObject(wt.HANDLE(handle), 20) == 0
+        drop()
+        return classify_hold(exit_code, signaled=signaled)
+
+    def release_thread(tid):
+        held = held_threads.pop(tid, None)
+        if held:
+            handle, owned = held
+            k32.ResumeThread(wt.HANDLE(handle))
+            if owned:
+                k32.CloseHandle(wt.HANDLE(handle))
+
+    # A hook step-over restores the original byte for one instruction. Every other thread is held
+    # for that step (--suspend-others 0 turns this off to measure what the window costs).
+    window = StepWindow(hold_thread, release_thread, protect=opts.get("--suspend-others", "1") != "0")
     file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace else None
 
     def arm(addr):
@@ -438,9 +495,16 @@ def main():
         thread, ctx = get_ctx(tid)
         if not thread:
             return False
+        if window.defer(tid):
+            # This thread trapped before it was held. Back to the hook address: it traps again, and
+            # is traced, once the window is closed and the byte is patched again.
+            struct.pack_into("<Q", ctx, 0xF8, addr)
+            set_ctx(thread)
+            return True
         regs = dict(zip(REGS, struct.unpack_from("<16Q", ctx, 0x78) + struct.unpack_from("<Q", ctx, 0xF8)))
         rsp = regs["Rsp"]
         if addr in hooks:
+            hook_entries[0] += 1
             name, arg = hooks[addr]
             ret = struct.unpack("<Q", read(rsp, 8) or b"\0" * 8)[0]
             # Every kind of trace reaches the common "if desc:" below, so the restore callback is
@@ -534,18 +598,15 @@ def main():
                 chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                 desc += " callers: " + " ".join(chain[:8])
             if desc:
-                returns.setdefault(ret, []).append((tid, rsp + 8, desc, restore))
+                returns.add(ret, tid, rsp + 8, (desc, restore), addr)
                 arm(ret)
-        for item in list(returns.get(addr, [])):
-            if item[0] == tid and item[1] == rsp:
-                returns[addr].remove(item)
-                # The name is temporary: the caller gets its own UNICODE_STRING back before anything
-                # else runs, so a failure or a retry sees the name it built.
-                if item[3]:
-                    item[3]()
-                file_log.write(f"{time.time() - start:7.3f} {item[2]} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
-                file_log.flush()
-        # Step over the original instruction, then re-arm.
+        for description, restore in returns.take(addr, tid, rsp):
+            if restore:
+                restore()
+            file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
+            file_log.flush()
+        # Step over the original instruction, then re-arm. Everyone else is held until the step is done.
+        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<Q", ctx, 0xF8, addr)
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
@@ -623,13 +684,17 @@ def main():
         if watches and time.time() >= watch_next:
             watch_next = time.time() + 1.0
             poll_watches()
+        if window.expire(time.monotonic()):
+            log(f"{time.time() - start:7.3f} hook step window expired, held threads resumed")
         if not k32.WaitForDebugEvent(event, 200):
             continue
         code, pid, tid = struct.unpack_from("<III", event, 0)
         status = DBG_CONTINUE
         if code == CREATE_PROCESS:
             live_threads.add(tid)
-            h_file, _, _, base = struct.unpack_from("<QQQQ", event, 16)
+            h_file, _, h_thread, base = struct.unpack_from("<QQQQ", event, 16)
+            if h_thread:
+                os_handles[tid] = h_thread
             main_base = base
             for item in filter(None, os.environ.get("X2W_COUNT", "").split(",")):
                 hooks[base + int(item, 16)] = (f"+{item}", "count")
@@ -675,8 +740,14 @@ def main():
         elif code == CREATE_THREAD:
             log(f"{time.time() - start:7.3f} thread {tid} created")
             live_threads.add(tid)
+            h_thread = struct.unpack_from("<Q", event, 16)[0]
+            if h_thread:
+                os_handles[tid] = h_thread
+            window.hold(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
+            window.finish(tid)
+            os_handles.pop(tid, None)
         elif code == EXIT_PROCESS:
             exit_code = struct.unpack_from("<I", event, 16)[0]
             log(f"{time.time() - start:7.3f} exit {exit_code:#010x}")
@@ -700,6 +771,7 @@ def main():
                 addr = stepping.pop(tid)
                 if addr in breakpoints:
                     write(addr, b"\xcc")
+                window.finish(tid)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                 continue
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
@@ -733,6 +805,7 @@ def main():
                 status = DBG_EXCEPTION_NOT_HANDLED
         k32.ContinueDebugEvent(pid, tid, status)
 
+    window.abandon()
     elapsed = time.time() - start
     if stop and stop_at:
         dump_threads(os.path.join(logdir, "threads_stop.txt"))
@@ -839,6 +912,11 @@ def main():
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
                                            for item in os.environ["X2W_COUNT"].split(",") if item))
+    report = window.summary(hook_entries[0])
+    print("  " + report)
+    if file_log:
+        file_log.write(report + "\n")
+        file_log.flush()
     if offline:
         print(f"  offline: {sum(denied.values())} network opens refused" +
               ("" if not denied else " (" + ", ".join(f"{k} x{v}" for k, v in list(denied.items())[:6]) + ")"))
