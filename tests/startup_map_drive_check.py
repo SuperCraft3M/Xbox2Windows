@@ -88,6 +88,21 @@ if not ok:
     failures.append(f"reuse: stdout {stdout.strip()!r}, name allocations {name_buffers}, "
                     f"rewrites {trace.count('MAP ')}")
 
+# Two threads with their own caller-owned names in flight at once. This is a separate control: today
+# the launcher drops some concurrent hits on the same hooked function, so it is registered as an
+# expected failure (see CMakeLists) rather than a gate. It has to fail for the documented reason and
+# will start failing the suite once it passes, which is the signal to turn it into a normal gate.
+if len(sys.argv) > 4 and sys.argv[4] == "overlap":
+    stdout, trace = run(letter, f"{letter}={package}", "map_overlap", mode="overlap")
+    traced = trace.count("NtCreateFile")
+    rewrites = trace.count("MAP ")
+    allocations = trace.count("NAMEBUF alloc")
+    print(f"two overlapping calls: {stdout.strip()!r} (traced {traced}, rewrites {rewrites}, "
+          f"name allocations {allocations})")
+    shutil.rmtree(package, ignore_errors=True)
+    ok = "overlap ok" in stdout and allocations >= 2
+    sys.exit(0 if ok else 1)
+
 shutil.rmtree(package, ignore_errors=True)
 if failures:
     print("FAIL")

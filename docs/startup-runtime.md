@@ -154,13 +154,17 @@ line for each rewrite and the rewritten path in `<log>/files.txt`. An open on a 
 mapped is left untouched. The rewritten name is borrowed for the hooked call only: the caller's
 `UNICODE_STRING` is restored (length, buffer pointer and contents) when the call returns, so a
 failure or a retry sees the name it built. When the replacement does not fit the caller's buffer the
-debugger writes it into one backing allocation that is grown on demand and reused, so the number of
-name allocations does not follow the number of opens. One limit remains: only opens that pass through
-the file hooks the launcher already installs are rewritten, so a title that reads its package through
-a memory-mapped API rather than an open is not covered. `startup_map_drive` covers the rewrite, the
+debugger borrows a name buffer for the duration of that call and returns it to a pool on restore, so
+serial opens reuse one buffer instead of allocating per open and overlapping calls do not share one.
+Two limits remain. Only opens that pass through the file hooks are rewritten, so a title that reads
+its package through a memory-mapped API is not covered. And the hooks are one patched byte per
+function, so a call that enters the same hooked function while another is being stepped over runs
+untraced and keeps its unmapped name — measured as 40 to 46 of 64 concurrent opens rewritten; see
+[#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281). `startup_map_drive` covers the rewrite, the
 negative control without the option, that an unmapped letter is left alone, and one caller-owned
-`UNICODE_STRING` reused across 32 opens with its length, buffer pointer and contents checked after
-every return and a single name allocation.
+`UNICODE_STRING` reused across 32 serially opened files with its length, buffer pointer and contents
+checked after every return and a single name buffer. `startup_map_drive_overlap` holds the two-thread
+control as an expected failure until the hooks stop dropping concurrent calls.
 
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). It writes:

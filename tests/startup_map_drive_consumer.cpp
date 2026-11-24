@@ -107,12 +107,96 @@ int reused_string()
     std::printf("reuse ok: %d opens, caller name intact after every return\n", reuse_opens);
     return 0;
 }
+// Two threads open through the mapped letter at the same time with their own caller-owned names.
+// Each rewritten name must stay valid for the call that is still in flight, so both threads must see
+// their own mapped file and get their own UNICODE_STRING back.
+struct Overlap {
+    HANDLE start;
+    wchar_t letter;
+    int opens;
+    LONG completed;
+    LONG broken;
+};
+
+DWORD WINAPI overlap_thread(LPVOID parameter)
+{
+    auto* shared = static_cast<Overlap*>(parameter);
+    wchar_t name[64];
+    _snwprintf_s(name, 64, _TRUNCATE, L"\\??\\%c:\\map_drive_probe.txt", shared->letter);
+    wchar_t built[64];
+    wcscpy_s(built, name);
+
+    UNICODE_STRING string{};
+    string.Buffer = name;
+    string.Length = static_cast<USHORT>(std::wcslen(name) * sizeof(wchar_t));
+    string.MaximumLength = string.Length;
+    OBJECT_ATTRIBUTES attributes{};
+    InitializeObjectAttributes(&attributes, &string, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+    const USHORT length = string.Length, maximum = string.MaximumLength;
+    PWSTR buffer = string.Buffer;
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    NtCreateFileFn create = nullptr;
+    NtCloseFn close = nullptr;
+    if (!ntdll || !resolve(ntdll, create, close)) return 1;
+
+    WaitForSingleObject(shared->start, INFINITE);
+    for (int index = 0; index < shared->opens; ++index) {
+        HANDLE handle = nullptr;
+        IO_STATUS_BLOCK status{};
+        const NTSTATUS result = create(&handle, GENERIC_READ | SYNCHRONIZE, &attributes, &status, nullptr,
+                                       FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OPEN,
+                                       FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+        if (result < 0) return 1;
+        close(handle);
+        if (string.Length != length || string.MaximumLength != maximum || string.Buffer != buffer ||
+            std::wcscmp(string.Buffer, built) != 0) {
+            InterlockedIncrement(&shared->broken);
+            return 1;
+        }
+        InterlockedIncrement(&shared->completed);
+        SwitchToThread();  // give the other thread a chance to be inside its own call
+    }
+    return 0;
+}
+
+int overlapping_names()
+{
+    Overlap shared{};
+    shared.start = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    shared.letter = probe_letter();
+    shared.opens = 32;
+    if (!shared.start) return 1;
+    HANDLE threads[2] = {CreateThread(nullptr, 0, overlap_thread, &shared, 0, nullptr),
+                         CreateThread(nullptr, 0, overlap_thread, &shared, 0, nullptr)};
+    if (!threads[0] || !threads[1]) return 1;
+    SetEvent(shared.start);
+    WaitForMultipleObjects(2, threads, TRUE, 30000);
+    const DWORD first = WaitForSingleObject(threads[0], 0), second = WaitForSingleObject(threads[1], 0);
+    for (HANDLE thread : threads) CloseHandle(thread);
+    CloseHandle(shared.start);
+    if (first != WAIT_OBJECT_0 || second != WAIT_OBJECT_0) {
+        std::printf("overlap threads did not finish\n");
+        return 1;
+    }
+    if (shared.broken) {
+        std::printf("overlap: a caller name was changed while its call was in flight\n");
+        return 1;
+    }
+    if (shared.completed != 2 * shared.opens) {
+        std::printf("overlap incomplete: %ld of %d opens succeeded\n", shared.completed, 2 * shared.opens);
+        return 1;
+    }
+    std::printf("overlap ok: %ld opens across two threads, both caller names intact\n", shared.completed);
+    return 0;
+}
 }  // namespace
 
 int main()
 {
     wchar_t mode[16]{};
-    const bool reuse = GetEnvironmentVariableW(L"X2W_PROBE_MODE", mode, 16) == 5 &&
-        _wcsicmp(mode, L"reuse") == 0;
-    return reuse ? reused_string() : single_open();
+    const DWORD len = GetEnvironmentVariableW(L"X2W_PROBE_MODE", mode, 16);
+    if (len == 5 && _wcsicmp(mode, L"reuse") == 0) return reused_string();
+    if (len == 7 && _wcsicmp(mode, L"overlap") == 0) return overlapping_names();
+    return single_open();
 }

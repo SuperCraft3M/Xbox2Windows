@@ -252,9 +252,11 @@ def main():
     # letter, so a package that sits on another volume never mounts. The file hooks rewrite the path
     # of an open on a mapped letter to the real folder, in the caller's own UNICODE_STRING.
     drive_map = {}
-    # One allocation holds the rewritten name whenever it does not fit the caller's own buffer, so
-    # repeated opens reuse it instead of leaving one allocation behind per open.
-    scratch = {"address": 0, "size": 0}
+    # Rewritten names live in buffers borrowed for the duration of one hooked call, so two calls that
+    # overlap on different threads cannot overwrite or free each other's name. A buffer goes back to
+    # the pool when that call's name is restored, so a serial run reuses one buffer instead of
+    # allocating per open and the allocation count does not follow the number of opens.
+    name_pool = {"free": [], "allocations": 0}
     for item in filter(None, opts.get("--map-drive", "").split(";")):
         letter, _, folder = item.partition("=")
         letter = letter.strip().rstrip(":").upper()
@@ -300,26 +302,38 @@ def main():
                 return None, None
             return replacement, lambda: (write(buffer, original), write(string_address, raw))
         # The replacement is longer than the caller's buffer, which is the common case: a folder path
-        # against a single letter. The name lives in one allocation that is grown on demand and reused,
-        # so the number of live name allocations does not follow the number of opens.
-        if scratch["size"] < len(encoded):
+        # against a single letter. Borrow a buffer from the pool for this call only; it is returned
+        # when the name is restored, so serial opens reuse one buffer but overlapping calls get their
+        # own.
+        address, capacity = 0, 0
+        for index, (candidate, room) in enumerate(name_pool["free"]):
+            if room >= len(encoded):
+                address, capacity = name_pool["free"].pop(index)
+                break
+        if not address:
             k32.VirtualAllocEx.restype = ctypes.c_void_p
             k32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
-            k32.VirtualFreeEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD]
             fresh = k32.VirtualAllocEx(wt.HANDLE(pi.hProcess), None, len(encoded), 0x3000, 0x04)
             if not fresh:
                 return None, None
-            if scratch["address"]:
-                k32.VirtualFreeEx(wt.HANDLE(pi.hProcess), ctypes.c_void_p(scratch["address"]), 0, 0x8000)
-            scratch["address"], scratch["size"] = fresh, len(encoded)
+            address, capacity = fresh, len(encoded)
+            name_pool["allocations"] += 1
             if file_log:
-                file_log.write(f"{time.time() - start:7.3f} NAMEBUF alloc {len(encoded)} bytes at {fresh:#x}\n")
+                file_log.write(f"{time.time() - start:7.3f} NAMEBUF alloc {len(encoded)} bytes at {fresh:#x} "
+                               f"(live {name_pool['allocations']})\n")
                 file_log.flush()
-        if not write(scratch["address"], encoded):
+        if not write(address, encoded):
+            name_pool["free"].append((address, capacity))
             return None, None
-        if not write(string_address, struct.pack("<HH4xQ", len(encoded), len(encoded), scratch["address"])):
+        if not write(string_address, struct.pack("<HH4xQ", len(encoded), len(encoded), address)):
+            name_pool["free"].append((address, capacity))
             return None, None
-        return replacement, lambda: write(string_address, raw)
+
+        def restore():
+            write(string_address, raw)
+            name_pool["free"].append((address, capacity))
+
+        return replacement, restore
 
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
     k32.GetModuleHandleW.restype = wt.HMODULE
@@ -428,7 +442,11 @@ def main():
         rsp = regs["Rsp"]
         if addr in hooks:
             name, arg = hooks[addr]
-            ret = read_qword(read, rsp) or 0
+            ret = struct.unpack("<Q", read(rsp, 8) or b"\0" * 8)[0]
+            # Every kind of trace reaches the common "if desc:" below, so the restore callback is
+            # initialised here: leaving it to the file-name branch would let a non-name trace see an
+            # unbound name or carry over the previous call's callback.
+            restore = None
             if arg == "valloc":
                 # NtAllocateVirtualMemory(process, &base, zero bits, &size, type, protect) and
                 # NtAllocateVirtualMemoryEx(process, &base, &size, type, protect, ...).
@@ -475,7 +493,6 @@ def main():
             elif arg == "bink":
                 desc = bink_call(name, regs, ret)
             else:
-                restore = None
                 if arg.startswith("ustr:"):
                     string_address = regs[arg[5:].capitalize()]
                     target = ustr(string_address)
