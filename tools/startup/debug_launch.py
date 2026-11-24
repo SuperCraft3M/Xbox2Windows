@@ -255,7 +255,8 @@ def main():
     for item in filter(None, opts.get("--map-drive", "").split(";")):
         letter, _, folder = item.partition("=")
         letter = letter.strip().rstrip(":").upper()
-        if len(letter) == 1 and letter.isalpha() and folder.strip():
+        # Letters are ASCII A-Z: isalpha() alone also accepts non-ASCII letters, which no NT path has.
+        if len(letter) == 1 and letter.isascii() and letter.isalpha() and folder.strip():
             # NT paths take backslashes; the option may arrive with either separator.
             drive_map[letter] = folder.strip().rstrip("\\/").replace("/", "\\")
 
@@ -263,24 +264,27 @@ def main():
         """Rewrites a mapped drive path in place; returns the new text, or None when nothing changed."""
         if not drive_map or not string_address:
             return None
-        root = ""
         body = text
-        if body.startswith("[root ") and "] " in body:
-            split = body.index("] ") + 2
-            root, body = body[:split], body[split:]
+        # oa_name() marks a root-relative name with a "[root 0x...]" tag for the log. That tag is not
+        # part of the name, so it is dropped here and never written into the caller's UNICODE_STRING.
+        if body.startswith("[root ") and "]" in body:
+            body = body[body.index("]") + 1:]
         prefix = ""
-        for candidate in ("\\??\\", "\\\\.\\"):
+        for candidate in ("\\??\\", "\\\\.\\", "\\\\?\\"):
             if body.upper().startswith(candidate):
                 prefix, body = body[:len(candidate)], body[len(candidate):]
                 break
         if len(body) < 2 or body[1] != ":" or body[0].upper() not in drive_map:
             return None
-        replacement = root + prefix + drive_map[body[0].upper()] + body[2:]
+        replacement = prefix + drive_map[body[0].upper()] + body[2:]
         raw = read(string_address, 16)
         if len(raw) < 16:
             return None
         _, maximum, buffer = struct.unpack_from("<HH4xQ", raw)
         encoded = replacement.encode("utf-16-le")
+        # A UNICODE_STRING length is a USHORT, so a longer name cannot be expressed at all.
+        if not 0 < len(encoded) <= 0xFFFF:
+            return None
         if len(encoded) <= maximum:
             if not write(buffer, encoded):
                 return None
