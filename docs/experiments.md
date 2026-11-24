@@ -12,6 +12,30 @@ arguments. Identifying both masks for the affected pipeline remains open. [Refs 
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Metadata-backed compressed portions (experimental)
+
+`X2W_DSTORAGE_CHUNK_WINDOWS=1` enables bounded RDS5 BCPack and zlib portion decoding in the startup
+storage stand-in. A validated boundary table must identify exactly one chunk matching the
+format, compressed size and requested 64 KiB source-window offset. The complete chunk is
+decoded and checked before any requested output bytes are published. Metadata and stored reads
+are capped at 1 MiB; decoded chunks at 16 MiB. Non-RDS5 inputs, ambiguous matches, malformed extents, corrupt streams
+and out-of-range windows retain the failure path. The window-offset convention remains an
+experimental runtime contract; this is not a general archive or DirectStorage implementation.
+
+`startup_chunk_windows` builds a 128 KiB BC1 stream by reinterleaving the existing source-authored
+synthetic lane fragments. It compares the first and second 64 KiB outputs with a full decode,
+requires direct short-output decoding to fail, and checks refusal and unchanged outputs for
+bad offsets, wrong sizes and codecs, invalid data, excessive counts and ambiguous matches.
+A second fixture uses 4 MiB of CPython-zlib output, verifies its checksum before publishing
+first, interior and final windows, and rejects an extent beyond the 16 MiB budget.
+Both run through the DirectStorage stand-in and check exact output and guard bytes; disabling
+the option makes the same bounded requests fail with unchanged destinations. The heartbeat's
+`metadata-windows` count records successful writes by this path.
+
+```powershell
+cmake --build --preset dev --target startup_chunk_window_check startup_stub_xcrdapi
+ctest --preset dev --no-tests=error -R '^startup_chunk_windows$' -V
+```
 ## One-dimensional texture sampling in startup draws
 
 The startup translator accepts ordinary 1D image sampling with a single coordinate and a
@@ -11573,6 +11597,8 @@ The [MASM fixture](../tests/cpu/sse4a.asm) exports 24 translated `op_*` function
 
 Not covered by this experiment: non-temporal cache-bypass hints, runtime `offset + width > 64` hardware-undefined behavior in register-form `extrq`/`insertq`, control flow or nonvolatile prologues, and title CPU code execution.
 
+Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
+
 ## Host-CPU RDFSBASE, RDGSBASE, and RDPID lifting in cpu_switch_aot
 
 [The switch translator](../tools/cpu_switch_aot.py) adds an opt-in `--host-cpu` (`host_cpu=True`) mode lifting read-only `rdfsbase`, `rdgsbase` (32- and 64-bit register forms), and `rdpid` (64-bit register form) from `docs/coverage/x64_zen2.tsv` group `Integer` to the `<immintrin.h>` intrinsics (`_readfsbase_u32`, `_readfsbase_u64`, `_readgsbase_u32`, `_readgsbase_u64`, `_rdpid_u32`):
@@ -11591,6 +11617,15 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_switch_fsgsbase_rdpid$' -V
 The [MASM fixture](../tests/cpu/switch_fsgsbase_rdpid.asm) exports 9 translated functions covering 32- and 64-bit `rdfsbase`/`rdgsbase` (with high-bit prefill), nonvolatile `rbx`/`r12`/`r13` reads, `rdpid` single and repeated reads, `FLAG_NEUTRAL` flag preservation across `add` to `setb`/`sete`/`sets`/`seto`/`setp`, and unused reads, plus native-only `CPUID.07H`, `RDTSCP`, and `FS_BASE`-roundtrip helpers and 7 rejected negative exports (including 32- and 64-bit `wrfsbase`/`wrgsbase`). [The differential check](../tests/cpu/switch_fsgsbase_rdpid_check.py) exits 77 if `CPUID.07H` lacks `FSGSBASE` (`EBX[0]`) or `RDPID` (`ECX[22]`) and otherwise pins the thread to up to four logical processors, verifying 232 CMake-lifted and 232 `/O2`-lifted checks across `dev` and `release` builds against native execution (including canonical `FS_BASE` sweeps via the native-only helper and `RDTSCP` `IA32_TSC_AUX`), five `/O2` mutated-C++ negative controls (`keep_high32`, `truncate_64`, `swap_fs_gs`, `constant_rdpid`, `clobber_flags`), 27 unit/MASM rejection controls, and 9 PE-patched DLL rejection controls, while recording decoded mnemonics through `FORM_COVERAGE_RECORD`.
 
 Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
+
+## Concurrent calls through a startup debugger hook
+
+The startup debugger holds every other thread while it steps one over a hooked function, so two threads entering the same hooked function are both traced ([#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281)). A run ends with `hook windows: ... unprotected=U`, the windows in which another thread could not be held or the 2 s deadline passed; `--suspend-others 0` turns the holding off. See [Concurrent calls through a hooked function](startup-runtime.md#concurrent-calls-through-a-hooked-function).
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
+```
 
 ## Render target binds with a single descriptor range
 

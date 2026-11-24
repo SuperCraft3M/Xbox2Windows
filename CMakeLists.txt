@@ -512,6 +512,11 @@ add_executable(startup_inflate_status tests/startup_inflate_status.cpp)
 target_compile_features(startup_inflate_status PRIVATE cxx_std_17)
 target_include_directories(startup_inflate_status PRIVATE src)
 add_test(NAME startup_inflate_status COMMAND startup_inflate_status)
+add_executable(startup_chunk_window_check tests/startup_chunk_window_check.cpp)
+target_include_directories(startup_chunk_window_check PRIVATE src)
+target_compile_features(startup_chunk_window_check PRIVATE cxx_std_17)
+add_test(NAME startup_chunk_windows COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_chunk_window_check.py" "$<TARGET_FILE:startup_chunk_window_check>" "$<TARGET_FILE:startup_stub_xcrdapi>")
+set_tests_properties(startup_chunk_windows PROPERTIES TIMEOUT 120)
 # An allocation failure on the DirectStorage stand-in's worker fails that request, and the worker
 # serves the next one (#1199). Skips (77) where the system does not enforce a job commit limit.
 add_executable(startup_storage_alloc_failure tests/startup_storage_alloc_failure.cpp)
@@ -582,6 +587,21 @@ target_link_libraries(startup_storage_worker_start PRIVATE psapi)
 add_test(NAME startup_storage_worker_start COMMAND startup_storage_worker_start)
 set_tests_properties(startup_storage_worker_start PROPERTIES TIMEOUT 60)
 target_compile_features(startup_stub_consumer PRIVATE cxx_std_17)
+# The launcher's --map-drive option: a console package on another volume is opened through a
+# mapped letter. The consumer is source-built and the launcher rewrites its open.
+add_executable(startup_map_drive_consumer tests/startup_map_drive_consumer.cpp)
+target_compile_features(startup_map_drive_consumer PRIVATE cxx_std_17)
+add_test(NAME startup_map_drive COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
+    "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
+    "${CMAKE_CURRENT_BINARY_DIR}")
+set_tests_properties(startup_map_drive PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+# Two calls overlapping on the mapped letter must both retain their rewritten names.
+# Hook step-window protection makes the former expected failure a required pass.
+add_test(NAME startup_map_drive_overlap COMMAND "${INTAKE_PYTHON}" -B
+    "${CMAKE_SOURCE_DIR}/tests/startup_map_drive_check.py"
+    "$<TARGET_FILE:startup_map_drive_consumer>" "${CMAKE_SOURCE_DIR}/tools/startup/debug_launch.py"
+    "${CMAKE_CURRENT_BINARY_DIR}" overlap)
+set_tests_properties(startup_map_drive_overlap PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 target_include_directories(startup_stub_consumer PRIVATE src)
 target_sources(startup_stub_consumer PRIVATE src/startup_stubs/runtime_proxy.cpp)
 target_link_libraries(startup_stub_consumer PRIVATE startup_stub_chad startup_stub_xg_xs xmem_shim d3d12_xs_shim)
@@ -2267,6 +2287,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_launch COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_check.py" "$<TARGET_FILE:startup_launch_probe>")
     set_tests_properties(startup_launch PROPERTIES TIMEOUT 120)
+    # The debugger's function hooks and concurrent calls (#1281): the step window's bookkeeping, then two
+    # threads through one hooked function with the other thread held for each step, and without.
+    add_test(NAME startup_hook_window COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py")
+    add_test(NAME startup_hook_overlap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_hook_check.py" "$<TARGET_FILE:startup_launch_probe>")
+    set_tests_properties(startup_hook_window PROPERTIES TIMEOUT 30)
+    set_tests_properties(startup_hook_overlap PROPERTIES TIMEOUT 600)
     add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>")
     set_tests_properties(startup_debug PROPERTIES TIMEOUT 300)

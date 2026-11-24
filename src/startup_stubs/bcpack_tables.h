@@ -2019,4 +2019,6 @@ inline constexpr uint32_t BC1_QUAD_MASKS[4][256] = {
     },
 };
 
+#include "bcpack_tables_bcn.inl"
+
 } // namespace x2w_bcpack

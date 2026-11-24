@@ -968,6 +968,249 @@ bool dstorage_checks() {
         }
     }
 
+    // Control: interleaved requests for distinct files in a single submission continue their own streams
+    // and correctly parse intermediate_size at +0x34 with +0x38 left as zero tag (Refs #1198)
+    {
+        const size_t plain1_size = 128 * 1024;
+        const size_t plain2_size = 64 * 1024;
+        const auto comp1 = make_fixed_deflate_zlib(0x41, plain1_size);
+        const auto comp2 = make_fixed_deflate_zlib(0x42, plain2_size);
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file1[MAX_PATH], temp_file2[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file1)) return false;
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file2)) {
+            DeleteFileW(temp_file1);
+            return false;
+        }
+
+        HANDLE h1 = CreateFileW(temp_file1, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE h2 = CreateFileW(temp_file2, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h1 == INVALID_HANDLE_VALUE || h2 == INVALID_HANDLE_VALUE) {
+            if (h1 != INVALID_HANDLE_VALUE) CloseHandle(h1);
+            if (h2 != INVALID_HANDLE_VALUE) CloseHandle(h2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        DWORD written = 0;
+        WriteFile(h1, comp1.data(), static_cast<DWORD>(comp1.size()), &written, nullptr);
+        WriteFile(h2, comp2.data(), static_cast<DWORD>(comp2.size()), &written, nullptr);
+        CloseHandle(h1);
+        CloseHandle(h2);
+
+        void* file_ptr1 = nullptr;
+        void* file_ptr2 = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file1, nullptr, &file_ptr1) != 0 || !file_ptr1 ||
+            reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file2, nullptr, &file_ptr2) != 0 || !file_ptr2) {
+            if (file_ptr1) reinterpret_cast<CloseFileFn>(static_cast<Object*>(file_ptr1)->vtable[3])(static_cast<Object*>(file_ptr1));
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* file_obj1 = static_cast<Object*>(file_ptr1);
+        auto* file_obj2 = static_cast<Object*>(file_ptr2);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "InterleavedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest1_0(64 * 1024, 0);
+        std::vector<unsigned char> dest2(64 * 1024, 0);
+        std::vector<unsigned char> dest1_1(64 * 1024, 0);
+
+        // Request 0: file 1 piece 0 (offset 0, 64 KiB destination).
+        unsigned char req1_0[0x48] = {};
+        *reinterpret_cast<u64*>(req1_0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_0 + 0x08) = dest1_0.data();
+        *reinterpret_cast<unsigned*>(req1_0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1_0 + 0x20) = file_obj1;
+        *reinterpret_cast<u64*>(req1_0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1_0 + 0x30) = static_cast<unsigned>(comp1.size());
+        *reinterpret_cast<unsigned*>(req1_0 + 0x38) = static_cast<unsigned>(plain1_size);
+
+        // Request 1: file 2 (offset 0, 64 KiB destination). Interleaved request for a different file in the same submission!
+        unsigned char req2[0x48] = {};
+        *reinterpret_cast<u64*>(req2 + 0x00) = 1;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest2.data();
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req2 + 0x20) = file_obj2;
+        *reinterpret_cast<u64*>(req2 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = static_cast<unsigned>(comp2.size());
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = static_cast<unsigned>(plain2_size);
+
+        // Request 2: file 1 piece 1 (offset 64 KiB, 64 KiB destination). Continuation of file 1!
+        unsigned char req1_1[0x48] = {};
+        *reinterpret_cast<u64*>(req1_1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_1 + 0x08) = dest1_1.data();
+        *reinterpret_cast<unsigned*>(req1_1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1_1 + 0x20) = file_obj1;
+        *reinterpret_cast<u64*>(req1_1 + 0x28) = 64 * 1024;
+        *reinterpret_cast<unsigned*>(req1_1 + 0x30) = static_cast<unsigned>(comp1.size());
+        *reinterpret_cast<unsigned*>(req1_1 + 0x38) = static_cast<unsigned>(plain1_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
+        reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+        reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+        DeleteFileW(temp_file1);
+        DeleteFileW(temp_file2);
+
+        if (hr0 != 0 || hr1 != 0 || hr2 != 0) return false;
+        for (unsigned char b : dest1_0) if (b != 0x41) return false;
+        for (unsigned char b : dest2) if (b != 0x42) return false;
+        for (unsigned char b : dest1_1) if (b != 0x41) return false;
+    }
+
+    // Control: independent same-size records with an aligned gap and an EOF request fail without cache fallback,
+    // leaving their destination buffers completely untouched (Refs #1198).
+    {
+        const size_t stream_plain_size = 64 * 1024;
+        const auto comp = make_fixed_deflate_zlib(0x55, stream_plain_size);
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+        HANDLE file = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        WriteFile(file, comp.data(), static_cast<DWORD>(comp.size()), &written, nullptr);
+        CloseHandle(file);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "IndependentRecordsStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        // Record 1: offset 0 (piece 0, 64 KiB destination)
+        std::vector<unsigned char> dest0(64 * 1024, 0);
+        // Record 2: offset 0x40000 (same compressed size, but with an aligned gap of 256 KiB!)
+        std::vector<unsigned char> dest_gap(64 * 1024, 0xA5);
+        // Record 3: offset 0x80000 (past EOF)
+        std::vector<unsigned char> dest_eof(64 * 1024, 0x5A);
+
+        unsigned char req0[0x48] = {};
+        *reinterpret_cast<u64*>(req0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req0 + 0x08) = dest0.data();
+        *reinterpret_cast<unsigned*>(req0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req0 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = static_cast<unsigned>(comp.size());
+        *reinterpret_cast<unsigned*>(req0 + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        unsigned char req_gap[0x48] = {};
+        *reinterpret_cast<u64*>(req_gap + 0x00) = 1;
+        *reinterpret_cast<void**>(req_gap + 0x08) = dest_gap.data();
+        *reinterpret_cast<unsigned*>(req_gap + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_gap + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_gap + 0x28) = 0x40000;
+        *reinterpret_cast<unsigned*>(req_gap + 0x30) = static_cast<unsigned>(comp.size());
+        *reinterpret_cast<unsigned*>(req_gap + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        unsigned char req_eof[0x48] = {};
+        *reinterpret_cast<u64*>(req_eof + 0x00) = 1;
+        *reinterpret_cast<void**>(req_eof + 0x08) = dest_eof.data();
+        *reinterpret_cast<unsigned*>(req_eof + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_eof + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_eof + 0x28) = 0x80000;
+        *reinterpret_cast<unsigned*>(req_eof + 0x30) = static_cast<unsigned>(comp.size());
+        *reinterpret_cast<unsigned*>(req_eof + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_gap);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_eof);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr_gap = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        long hr_eof = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        if (hr0 != 0) return false;
+        for (unsigned char b : dest0) if (b != 0x55) return false;
+
+        if (hr_gap == 0 || hr_eof == 0) return false;
+        for (unsigned char b : dest_gap) if (b != 0xA5) return false;
+        for (unsigned char b : dest_eof) if (b != 0x5A) return false;
+    }
+
     // Control: standalone stream with damaged checksum at matching offset fails and leaves destination unchanged (Refs #1214)
     {
         const size_t stream_plain_size = 128 * 1024;
@@ -1575,6 +1818,63 @@ bool dstorage_checks() {
             0xc2, 0x5b, 0x48, 0x7a, 0xea, 0x84, 0xa4, 0x4b, 0xfd, 0xf7, 0x15, 0x87, 0x90, 0xc4, 0x49, 0xac
         };
 
+        // 2-block BC4 stream exercising history lookup (block 1 references block 0)
+        // and residual delta summation (74 bytes -> 16 bytes destination).
+        // Generated using tools/_bcpack_rans reference encoder (Ahmet-Dedeler/bcpack-rs rev c55c5fad5396).
+        const unsigned char bc4_packed[74] = {
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x04, 0x03, 0x03, 0x03,
+            0x03, 0x03, 0x03, 0x03, 0x01, 0x01, 0x01, 0x01, 0x10, 0x10, 0x10, 0x10,
+            0x02, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x28,
+            0x00, 0x04, 0x08, 0x0c, 0x03, 0x03, 0x06, 0x08, 0x09, 0x08, 0x0c, 0x10,
+            0x02, 0x10, 0x10, 0x10, 0x10, 0x03, 0x03, 0x03, 0x04, 0x10, 0x10, 0x10,
+            0x10, 0x00, 0x00, 0x00, 0x04, 0x10, 0x14, 0x18, 0x1c, 0x14, 0x18, 0x1c,
+            0x00, 0x11
+        };
+        const unsigned char bc4_expected[16] = {
+            0x8a, 0x94, 0x09, 0xb0, 0xd9, 0x64, 0x3b, 0x60,
+            0x8d, 0x98, 0xc9, 0x96, 0x00, 0xc9, 0xbb, 0x45
+        };
+
+        // 2-block BC5 stream exercising history lookup (block 1 references block 0)
+        // and residual delta summation (96 bytes -> 32 bytes destination).
+        // Generated using tools/_bcpack_rans reference encoder (Ahmet-Dedeler/bcpack-rs rev c55c5fad5396).
+        const unsigned char bc5_packed[96] = {
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x05, 0x05, 0x05, 0x05,
+            0x05, 0x05, 0x05, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x0a, 0x1e,
+            0x01, 0x08, 0x10, 0x18, 0x03, 0x02, 0x14, 0x28, 0x05, 0x0c, 0x14, 0x1c,
+            0x03, 0x03, 0x04, 0x08, 0x04, 0x0c, 0x14, 0x1c, 0x10, 0x10, 0x10, 0x10,
+            0x05, 0x05, 0x05, 0x05, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x20, 0x28, 0x30, 0x38, 0x24, 0x2c, 0x34, 0x3c, 0x08, 0x10, 0x18, 0x20,
+            0x02, 0x02, 0x06, 0x0a, 0x08, 0x10, 0x18, 0x20, 0x0c, 0x14, 0x1c, 0x24
+        };
+        const unsigned char bc5_expected[32] = {
+            0x85, 0x8a, 0x40, 0x42, 0x6e, 0xf6, 0x4f, 0x80,
+            0x8f, 0x94, 0x88, 0x14, 0x0c, 0x58, 0x2b, 0x40,
+            0x87, 0x8d, 0xc9, 0x66, 0x27, 0xa4, 0x4e, 0x62,
+            0x93, 0x99, 0x1c, 0x59, 0xe3, 0x5c, 0xa3, 0x68
+        };
+
+        // 2-block BC3 stream exercising history lookup (block 1 references block 0)
+        // and residual delta summation (95 bytes -> 32 bytes destination).
+        // Generated using tools/_bcpack_rans reference encoder (Ahmet-Dedeler/bcpack-rs rev c55c5fad5396).
+        const unsigned char bc3_packed[95] = {
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x05, 0x05, 0x05, 0x05,
+            0x05, 0x05, 0x06, 0x04, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x0f, 0x01,
+            0x08, 0x10, 0x19, 0x16, 0x03, 0x02, 0x19, 0x05, 0x0c, 0x14, 0x1c, 0x20,
+            0x03, 0x03, 0x06, 0x04, 0x0c, 0x14, 0x1c, 0x40, 0x10, 0x10, 0x10, 0x10,
+            0x05, 0x04, 0x05, 0x05, 0x01, 0x10, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x08, 0x16, 0x01, 0x03, 0x10, 0x20, 0x02, 0x04, 0x18, 0x40, 0x03, 0x01,
+            0x02, 0x02, 0x08, 0x08, 0x10, 0x18, 0x00, 0x20, 0x04, 0x02, 0x11
+        };
+        const unsigned char bc3_expected[32] = {
+            0x78, 0x73, 0x40, 0x62, 0x93, 0x5b, 0xfb, 0xc7,
+            0x21, 0x08, 0x42, 0x10, 0xfa, 0xfa, 0x00, 0x50,
+            0x7b, 0x77, 0x49, 0x0b, 0xd8, 0xff, 0x66, 0xc6,
+            0x84, 0x20, 0xc6, 0x30, 0xfa, 0xaa, 0xfa, 0xaa
+        };
+
         // 64-block BC1 stream from tools/_bcpack_rans/vectors/synthetic_11.json (515 bytes)
         const unsigned char bc1_packed[515] = {
             0x15, 0x14, 0x1b, 0x1b, 0xdf, 0x10, 0x13, 0x14, 0x3d, 0x3e, 0x09, 0x11, 0x03, 0x28, 0x14, 0x03,
@@ -1653,7 +1953,7 @@ bool dstorage_checks() {
         };
 
         void* status_ptr = nullptr;
-        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 7, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 11, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
             return false;
         }
         auto* status = static_cast<Object*>(status_ptr);
@@ -1672,6 +1972,10 @@ bool dstorage_checks() {
         std::vector<unsigned char> dest_truncated(32, 0xCC);
         std::vector<unsigned char> dest_bc1_valid(512, 0xEE);
         std::vector<unsigned char> dest_bc1_trailing(512, 0xDD);
+        std::vector<unsigned char> dest_bc4_wrong_size(8, 0x5A);
+        std::vector<unsigned char> dest_bc4(16, 0x44);
+        std::vector<unsigned char> dest_bc5(32, 0x55);
+        std::vector<unsigned char> dest_bc3(32, 0x33);
         std::vector<unsigned char> dest_bc6h_blank(64, 0xAA);
 
         // Request 0: valid BC7 Mode 6 memory request (32 bytes destination, 2 blocks)
@@ -1740,17 +2044,60 @@ bool dstorage_checks() {
         *reinterpret_cast<unsigned*>(req5 + 0x30) = sizeof(bc1_packed_trailing);
         *reinterpret_cast<unsigned*>(req5 + 0x38) = 512;
 
-        // Request 6: BCPack format 6 (BC6H) is not decoded yet; it must be zero-filled and counted.
-        static const unsigned char bc6h_packed[] = {0x00, 0x01, 0x02, 0x03};
+        // Request 6: wrong destination size for BC4 (negative control: 8 bytes destination for 16-byte stream)
         unsigned char req6[0x48] = {};
-        *reinterpret_cast<u64*>(req6 + 0x00) = (6ull << 1) | 0x400000;
-        *reinterpret_cast<void**>(req6 + 0x08) = dest_bc6h_blank.data();
+        *reinterpret_cast<u64*>(req6 + 0x00) = (4ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req6 + 0x08) = dest_bc4_wrong_size.data();
         *reinterpret_cast<u64*>(req6 + 0x10) = 0;
-        *reinterpret_cast<unsigned*>(req6 + 0x18) = 64;
-        *reinterpret_cast<const unsigned char**>(req6 + 0x20) = bc6h_packed;
+        *reinterpret_cast<unsigned*>(req6 + 0x18) = 8;
+        *reinterpret_cast<const unsigned char**>(req6 + 0x20) = bc4_packed;
         *reinterpret_cast<u64*>(req6 + 0x28) = 0;
-        *reinterpret_cast<unsigned*>(req6 + 0x30) = sizeof(bc6h_packed);
-        *reinterpret_cast<unsigned*>(req6 + 0x38) = 64;
+        *reinterpret_cast<unsigned*>(req6 + 0x30) = sizeof(bc4_packed);
+        *reinterpret_cast<unsigned*>(req6 + 0x38) = 8;
+
+        // Request 7: valid BC4 memory request (16 bytes destination, 2 blocks, subsequent valid request)
+        unsigned char req7[0x48] = {};
+        *reinterpret_cast<u64*>(req7 + 0x00) = (4ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req7 + 0x08) = dest_bc4.data();
+        *reinterpret_cast<u64*>(req7 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req7 + 0x18) = 16;
+        *reinterpret_cast<const unsigned char**>(req7 + 0x20) = bc4_packed;
+        *reinterpret_cast<u64*>(req7 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req7 + 0x30) = sizeof(bc4_packed);
+        *reinterpret_cast<unsigned*>(req7 + 0x38) = 16;
+
+        // Request 8: valid BC5 memory request (32 bytes destination, 2 blocks)
+        unsigned char req8[0x48] = {};
+        *reinterpret_cast<u64*>(req8 + 0x00) = (5ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req8 + 0x08) = dest_bc5.data();
+        *reinterpret_cast<u64*>(req8 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req8 + 0x18) = 32;
+        *reinterpret_cast<const unsigned char**>(req8 + 0x20) = bc5_packed;
+        *reinterpret_cast<u64*>(req8 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req8 + 0x30) = sizeof(bc5_packed);
+        *reinterpret_cast<unsigned*>(req8 + 0x38) = 32;
+
+        // Request 9: valid BC3 memory request (32 bytes destination, 2 blocks)
+        unsigned char req9[0x48] = {};
+        *reinterpret_cast<u64*>(req9 + 0x00) = (3ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req9 + 0x08) = dest_bc3.data();
+        *reinterpret_cast<u64*>(req9 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req9 + 0x18) = 32;
+        *reinterpret_cast<const unsigned char**>(req9 + 0x20) = bc3_packed;
+        *reinterpret_cast<u64*>(req9 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req9 + 0x30) = sizeof(bc3_packed);
+        *reinterpret_cast<unsigned*>(req9 + 0x38) = 32;
+        // Request 10: BCPack format 6 (BC6H) is not decoded yet; it must be zero-filled and counted.
+        static const unsigned char bc6h_packed[] = {0x00, 0x01, 0x02, 0x03};
+        unsigned char req10[0x48] = {};
+        *reinterpret_cast<u64*>(req10 + 0x00) = (6ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req10 + 0x08) = dest_bc6h_blank.data();
+        *reinterpret_cast<u64*>(req10 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req10 + 0x18) = 64;
+        *reinterpret_cast<const unsigned char**>(req10 + 0x20) = bc6h_packed;
+        *reinterpret_cast<u64*>(req10 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req10 + 0x30) = sizeof(bc6h_packed);
+        *reinterpret_cast<unsigned*>(req10 + 0x38) = 64;
 
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
@@ -1766,10 +2113,18 @@ bool dstorage_checks() {
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 5);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req6);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 6);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req7);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 7);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req8);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 8);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req9);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 9);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req10);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 10);
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
 
         for (int i = 0; i < 200; ++i) {
-            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6)) break;
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 10)) break;
             Sleep(10);
         }
         if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
@@ -1778,7 +2133,11 @@ bool dstorage_checks() {
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 3) ||
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 4) ||
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6)) {
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 7) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 8) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 9) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 10)) {
             return false;
         }
 
@@ -1789,6 +2148,10 @@ bool dstorage_checks() {
         long hr4 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 4);
         long hr5 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 5);
         long hr6 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 6);
+        long hr7 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 7);
+        long hr8 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 8);
+        long hr9 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 9);
+        long hr10 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 10);
 
         if (hr0 != 0 || std::memcmp(dest_bc7_mode6.data(), bc7_mode6_expected, 32) != 0) return false;
         if (hr1 == 0) return false;
@@ -1805,7 +2168,14 @@ bool dstorage_checks() {
         for (unsigned char b : dest_bc1_trailing) {
             if (b != 0xDD) return false;
         }
-        if (hr6 != 0) return false;
+        if (hr6 == 0) return false;
+        for (unsigned char b : dest_bc4_wrong_size) {
+            if (b != 0x5A) return false;
+        }
+        if (hr7 != 0 || std::memcmp(dest_bc4.data(), bc4_expected, 16) != 0) return false;
+        if (hr8 != 0 || std::memcmp(dest_bc5.data(), bc5_expected, 32) != 0) return false;
+        if (hr9 != 0 || std::memcmp(dest_bc3.data(), bc3_expected, 32) != 0) return false;
+        if (hr10 != 0) return false;
         for (unsigned char b : dest_bc6h_blank) {
             if (b != 0) return false;
         }

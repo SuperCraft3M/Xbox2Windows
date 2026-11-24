@@ -1024,6 +1024,27 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             facts.token_known = known;
             facts.resource_wrapper = had_texture;
             facts.dimension_matches = !mismatched;
+            // Opt-in, bounded evidence for late descriptor failures; keep raw captures local.
+            static const bool binding_diagnostics = x2w_local::env_on("X2W_BINDING_DIAGNOSTICS");
+            if (binding_diagnostics && (!facts.token_magic || !facts.token_known)) {
+                static std::unordered_set<u64> reported;
+                const u64 signature = tr->key ^ (u64{i} << 48) ^ (u64{words[0]} << 16) ^ words[1];
+                std::uint32_t shadow = 0;
+                AcquireSRWLockExclusive(&note_lock);
+                const bool show = reported.size() < 64 && reported.insert(signature).second;
+                for (const auto& heap : heap_infos()) {
+                    if (!heap.title_cpu || !heap.increment || entry < heap.title_cpu) continue;
+                    const u64 delta = entry - heap.title_cpu;
+                    if (delta % heap.increment == 0 && delta / heap.increment < heap.count && heap.shadow) {
+                        shadow = heap.shadow[delta / heap.increment];
+                        break;
+                    }
+                }
+                const bool shadow_known = shadow && shadow - 1 < view_records().size();
+                ReleaseSRWLockExclusive(&note_lock);
+                if (show) log("x2w-binding diagnostic key=%016llx srv=%u entry=0x%llx words=%08x,%08x,%08x,%08x readable=%d magic=%d known=%d shadow=%u shadow_known=%d",
+                    tr->key, i, entry, words[0], words[1], words[2], words[3], entry_ok, facts.token_magic, known, shadow, shadow_known);
+            }
             count_null_binding(x2w_local::classify_null_binding(facts));
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;

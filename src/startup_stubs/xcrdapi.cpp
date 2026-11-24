@@ -13,6 +13,7 @@
 #include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
 #include "startup_stubs/bcpack_decoder.h"
+#include "startup_stubs/storage_chunk_window.h"
 
 #include <psapi.h>
 
@@ -177,18 +178,19 @@ static bool destination_writable(const void* destination, std::size_t bytes)
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
-// Status entries are skipped, and any unrelated request, submission boundary, or non-matching
-// source/offset ends the continuation chain.
+// Status entries and requests for unrelated files are skipped. In the same file, any non-matching
+// size, non-consecutive offset, or submission boundary ends the continuation chain (Refs #1136, #1144, #1198, #1214).
 static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission_id, u64 source, u64 offset,
-                                            unsigned source_size, unsigned destination_size, std::size_t total_size)
+                                            unsigned source_size, unsigned destination_size, std::size_t total_size,
+                                            unsigned* out_step = nullptr)
 {
     std::vector<u64> ids;
+    if (out_step) *out_step = destination_size ? destination_size : 0x10000;
     if (!self || !self->work) return ids;
     QueueWork& work = *self->work;
     const std::lock_guard guard(work.mutex);
-    const unsigned step = destination_size ? destination_size : 0x10000;
-    u64 expected = offset + step;
-    if (expected < offset) return ids;
+    unsigned step = 0;
+    u64 expected = 0;
 
     for (const auto& e : work.submitted) {
         if (e.submission_id != current_submission_id) {
@@ -196,17 +198,37 @@ static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission
         }
         if (e.type != Entry::request) continue;
         const u64 e_options = *reinterpret_cast<const u64*>(e.bytes);
+        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
+
+        // Skip requests for other files (interleaving across unrelated files within one submission)
+        if (e_source != source) {
+            continue;
+        }
+
+        // For the SAME file, requests must strictly be compressed file requests continuing this sequence
         if (!(e_options & 1) || (e_options & 0x400000)) {
             break;
         }
-        const u64 e_source = *reinterpret_cast<const u64*>(e.bytes + 0x20);
         const u64 e_offset = *reinterpret_cast<const u64*>(e.bytes + 0x28);
         const unsigned e_source_size = *reinterpret_cast<const unsigned*>(e.bytes + 0x30);
-        if (e_source != source || e_source_size != source_size || e_offset != expected) {
+        if (e_source_size != source_size) {
+            break;
+        }
+        if (ids.empty()) {
+            if (e_offset == offset + destination_size) {
+                step = destination_size;
+            } else if (e_offset == offset + 0x10000) {
+                step = 0x10000;
+            } else {
+                break;
+            }
+            expected = offset + step;
+        }
+        if (e_offset != expected) {
             break;
         }
         const u64 delta = expected - offset;
-        if (delta >= total_size) {
+        if (delta >= total_size || delta > UINT32_MAX) {
             break;
         }
         ids.push_back(e.id);
@@ -215,6 +237,7 @@ static std::vector<u64> following_chunk_ids(Object* self, u64 current_submission
         }
         expected += step;
     }
+    if (out_step && step) *out_step = step;
     return ids;
 }
 
@@ -384,6 +407,7 @@ long __stdcall file_information(Object* self, BY_HANDLE_FILE_INFORMATION* info)
 // or memory pointer), +0x28 source offset, +0x30 source size (u32). Uncompressed requests are executed
 // synchronously; compressed ones are logged and left undone. The first requests are logged in full.
 LONG requests_done, requests_compressed, requests_failed, requests_bcpack_blank;
+LONG requests_metadata_windows;
 
 // Failed requests by cause, for the heartbeat (#1198). Each failure site names its cause and
 // count_failure adds it to requests_failed as well, so the causes add up to that total. "other" holds
@@ -521,8 +545,53 @@ int format_page_ends(char* out, std::size_t size, int second, const PageEndCount
                          second, n[0][0], n[0][1], n[1][0], n[1][1], n[2][0], n[2][1]);
 }
 
-LONG bcpack_requests[16], bcpack_blank[16];
 LONG zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue;
+// Try to serve an identified continuation slice of an already-inflated chunked stream from the in-memory cache
+// (Refs #1136, #1144, #1198, #1214). Returns true if this request was matched as a continuation slice.
+static bool try_serve_cached_continuation(Object* self, u64 source, u64 offset, unsigned source_size,
+                                         unsigned destination_size, u64 entry_id,
+                                         std::vector<unsigned char>& output, std::size_t& decode_length,
+                                         const char*& outcome, const unsigned char*& data)
+{
+    if (!self || !self->work) return false;
+    QueueWork& work = *self->work;
+    const std::lock_guard guard(work.mutex);
+    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
+        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
+            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
+            if (pos != it->continuation_ids.end()) {
+                const u64 delta = offset - it->base_offset;
+                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
+                if ((delta % step) == 0 && delta < it->data.size() && delta <= UINT32_MAX) {
+                    const std::size_t available = it->data.size() - static_cast<std::size_t>(delta);
+                    if (destination_size > available) {
+                        outcome = "destination capacity exceeded";
+                        data = nullptr;
+                        it->continuation_ids.erase(pos);
+                        if (it->continuation_ids.empty()) {
+                            work.cached_streams.erase(it);
+                        }
+                        return true;
+                    }
+                    const std::size_t slice_size = destination_size < available ? destination_size : available;
+                    if (slice_size > 0) {
+                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
+                        decode_length = slice_size;
+                        data = output.data();
+                        outcome = "inflated (slice from stream cache)";
+                        it->continuation_ids.erase(pos);
+                        if (it->continuation_ids.empty()) {
+                            work.cached_streams.erase(it);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+LONG bcpack_requests[16], bcpack_blank[16];
 
 const char* format_counts(char* out, std::size_t size, LONG* counts)
 {
@@ -585,6 +654,13 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
+    const unsigned char* data = nullptr;
+    std::size_t decode_length = source_size;
+    const std::size_t destination_capacity = destination_size;
+    bool written = false;
+    bool cached_continuation = false;
+    bool metadata_window = false;
+
     if (options & ~known) {
         outcome = "unknown option bits, not done";
     } else if (!destination || !source_size) {
@@ -593,26 +669,41 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
         input = reinterpret_cast<const unsigned char*>(source);
     } else {
         auto* file_object = reinterpret_cast<Object*>(source);
+        static const bool windows = x2w_local::env_on("X2W_DSTORAGE_CHUNK_WINDOWS") || x2w_local::env_on("X2W_DSTORAGE_BCPACK_WINDOWS");
+        LARGE_INTEGER file_size{};
+        if (windows && ((bcpack && !zlib) || (zlib && !bcpack)) && file_object && file_object->kind == file &&
+            GetFileSizeEx(file_object->handle, &file_size) && file_size.QuadPart > 0 &&
+            x2w_startup::decode_chunk_window([&](u64 start, std::size_t bytes, std::vector<unsigned char>& target) {
+                return x2w_startup::read_storage_file(file_object->handle, start, bytes, target);
+            }, static_cast<u64>(file_size.QuadPart), offset, source_size, destination_size, zlib ? 8 : bcpack, output)) {
+            data = output.data();
+            decode_length = output.size();
+            cached_continuation = metadata_window = true;
+            outcome = zlib ? "inflated metadata window" : "bcpack decoded window";
+        } else
         if (file_object && file_object->kind == file &&
-            x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed))
+            x2w_startup::read_storage_file(file_object->handle, offset, source_size, packed)) {
             input = packed.data();
-        else {
-            outcome = "read failed";
-            failure = read_failure_cause(file_object, offset, source_size);
+        } else {
+            // Read failed or offset extends beyond compressed file EOF. Check if this request is a
+            // proven continuation slice of an already-inflated chunked stream on this queue (Refs #1136, #1144, #1198).
+            if (zlib && destination && source_size &&
+                try_serve_cached_continuation(self, source, offset, source_size, destination_size, entry_id,
+                                             output, decode_length, outcome, data)) {
+                cached_continuation = true;
+            } else {
+                outcome = "read failed";
+                failure = read_failure_cause(file_object, offset, source_size);
+            }
         }
     }
-    const unsigned char* data = nullptr;
-    std::size_t decode_length = source_size;
-    const std::size_t destination_capacity = destination_size;
-    bool written = false;
 
-    if (input) {
+    if (!cached_continuation && input) {
         data = input;
         if (zlib) {
             bool direct_decoded = false;
             bool decode_error = false;
             if (has_zlib_header(input, source_size)) {
-                // With BCPack after it, the inflated size is not given; the destination size bounds it.
                 // DirectStorage provides UncompressedSize at request + 0x38. When destination is smaller
                 // than the stream (e.g. 64 KiB tile/page target), allocate for the full uncompressed stream
                 // so single-pass inflate succeeds and verifies Adler32, then check capacity before writing.
@@ -639,14 +730,15 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     output.resize(produced);
                     bool cached_chunked = false;
                     // If the stream expanded beyond this request's destination and continuation chunks are queued
-                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1214).
+                    // in this submission, scope the cache to those identified continuation requests and serve slice 0 (Refs #1136, #1144, #1198, #1214).
                     // BCPack streams are atomic multi-lane rANS payloads; they are not chunk-split continuation streams (Refs #1139).
                     if (!memory_source && !bcpack && produced > destination_size && self && self->work) {
-                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced);
+                        unsigned detected_step = destination_size;
+                        auto continuation_ids = following_chunk_ids(self, submission_id, source, offset, source_size, destination_size, produced, &detected_step);
                         if (!continuation_ids.empty()) {
                             QueueWork& work = *self->work;
                             const std::lock_guard guard(work.mutex);
-                            work.put_stream(source, offset, source_size, destination_size, std::move(continuation_ids), output);
+                            work.put_stream(source, offset, source_size, detected_step, std::move(continuation_ids), output);
                             decode_length = destination_size;
                             data = output.data();
                             outcome = "inflated (chunked stream piece 0)";
@@ -664,42 +756,12 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
 
-            // If not directly decoded from a standalone stream, check if this request is a continuation
-            // slice of an already-inflated chunked stream on this queue (Refs #1136, #1144, #1214).
-            // A request presenting a zlib header that failed decode (e.g. damaged checksum) is an actual
-            // decode error and must stay distinct from a proven continuation. Memory requests stay strictly on direct decode.
-            if (!direct_decoded && !decode_error && !memory_source && self && self->work) {
-                auto* file_object = reinterpret_cast<Object*>(source);
-                if (file_object && file_object->kind == file && file_object->handle != INVALID_HANDLE_VALUE) {
-                    QueueWork& work = *self->work;
-                    const std::lock_guard guard(work.mutex);
-                    for (auto it = work.cached_streams.begin(); it != work.cached_streams.end(); ++it) {
-                        if (it->source == source && it->compressed_size == source_size && offset > it->base_offset) {
-                            auto pos = std::find(it->continuation_ids.begin(), it->continuation_ids.end(), entry_id);
-                            if (pos != it->continuation_ids.end()) {
-                                const u64 delta = offset - it->base_offset;
-                                const unsigned step = it->chunk_size ? it->chunk_size : 0x10000;
-                                if ((delta % step) == 0 && delta < it->data.size()) {
-                                    const std::size_t available = it->data.size() - delta;
-                                    // Handle short final destinations in multi-piece streams (Refs #1144)
-                                    const std::size_t slice_size = destination_size < available ? destination_size : available;
-                                    if (slice_size > 0 && destination_size <= available) {
-                                        output.assign(it->data.begin() + delta, it->data.begin() + delta + slice_size);
-                                        decode_length = slice_size;
-                                        data = output.data();
-                                        outcome = "inflated (slice from stream cache)";
-                                        direct_decoded = true;
-                                        it->continuation_ids.erase(pos);
-                                        if (it->continuation_ids.empty()) {
-                                            work.cached_streams.erase(it);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            // If not directly decoded from a standalone stream and not a decode error (e.g. damaged checksum),
+            // check if this request is a continuation slice of an already-inflated chunked stream on this queue (Refs #1136, #1144, #1214).
+            if (!direct_decoded && !decode_error && !memory_source && destination && source_size &&
+                try_serve_cached_continuation(self, source, offset, source_size, destination_size, entry_id,
+                                             output, decode_length, outcome, data)) {
+                direct_decoded = true;
             }
 
             if (!direct_decoded) {
@@ -715,55 +777,56 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
         }
-        bool bcpack_decoded = false;
-        if (data && bcpack) {
-            if (bcpack == 7 || bcpack == 1) {
-                std::vector<unsigned char> decoded(destination_size);
-                std::size_t produced = 0;
-                if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
-                    output = std::move(decoded);
-                    data = output.data();
-                    decode_length = produced;
-                    outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
-                    bcpack_decoded = true;
-                } else {
-                    outcome = "bcpack failed";
-                    failure = StorageFailure::bcpack;
-                    data = nullptr;
-                }
-            } else {
-                // shortcut for formats not decoded yet: texels are left zero (a blank texture) so the
-                // title's loading continues. Counted as bcpack_blank.
-                output.assign(destination_size, 0);
+    }
+
+    bool bcpack_decoded = metadata_window;
+    if (data && bcpack && !metadata_window) {
+        if (bcpack == 7 || bcpack == 1 || bcpack == 4 || bcpack == 5 || bcpack == 3) {
+            std::vector<unsigned char> decoded(destination_size);
+            std::size_t produced = 0;
+            if (x2w_bcpack::decode_bcpack(data, decode_length, bcpack, decoded.data(), decoded.size(), &produced)) {
+                output = std::move(decoded);
                 data = output.data();
-                decode_length = destination_size;
-                outcome = "BCPack not decoded: zero-filled";
-            }
-        }
-        if (data) {
-            // Track decode length and destination capacity as separate values (Refs #1144).
-            // A short destination or missing/insufficient page grant must fail the request
-            // and leave the destination memory completely unchanged.
-            if (decode_length > destination_capacity) {
-                outcome = "destination capacity exceeded";
-                failure = StorageFailure::destination_capacity;
+                decode_length = produced;
+                outcome = zlib ? "inflated + bcpack decoded" : "bcpack decoded";
+                bcpack_decoded = true;
+            } else {
+                outcome = "bcpack failed";
+                failure = StorageFailure::bcpack;
                 data = nullptr;
-            } else if (page_destination) {
-                const ULONG_PTR needed_pages = (page_offset + decode_length + 0xFFFF) / 0x10000;
-                const ULONG_PTR granted_pages = (page_offset + destination_capacity + 0xFFFF) / 0x10000;
-                if (needed_pages > granted_pages) {
-                    outcome = "insufficient page grants";
-                    data = nullptr;
-                } else if (!tokens) {
-                    outcome = "missing page tokens";
-                    data = nullptr;
-                } else {
-                    for (ULONG_PTR i = 0; i < needed_pages; ++i) {
-                        if (!tokens[i]) {
-                            outcome = "missing page grant token";
-                            data = nullptr;
-                            break;
-                        }
+            }
+        } else {
+            // shortcut for formats not decoded yet: texels are left zero (a blank texture) so the
+            // title's loading continues. Counted as bcpack_blank.
+            output.assign(destination_size, 0);
+            data = output.data();
+            decode_length = destination_size;
+            outcome = "BCPack not decoded: zero-filled";
+        }
+    }
+    if (data) {
+        // Track decode length and destination capacity as separate values (Refs #1144).
+        // A short destination or missing/insufficient page grant must fail the request
+        // and leave the destination memory completely unchanged.
+        if (decode_length > destination_capacity) {
+            outcome = "destination capacity exceeded";
+            failure = StorageFailure::destination_capacity;
+            data = nullptr;
+        } else if (page_destination) {
+            const ULONG_PTR needed_pages = (page_offset + decode_length + 0xFFFF) / 0x10000;
+            const ULONG_PTR granted_pages = (page_offset + destination_capacity + 0xFFFF) / 0x10000;
+            if (needed_pages > granted_pages) {
+                outcome = "insufficient page grants";
+                data = nullptr;
+            } else if (!tokens) {
+                outcome = "missing page tokens";
+                data = nullptr;
+            } else {
+                for (ULONG_PTR i = 0; i < needed_pages; ++i) {
+                    if (!tokens[i]) {
+                        outcome = "missing page grant token";
+                        data = nullptr;
+                        break;
                     }
                 }
             }
@@ -796,6 +859,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 }
             }
             if (written) {
+                if (metadata_window) InterlockedIncrement(&requests_metadata_windows);
                 if (bcpack && !bcpack_decoded) {
                     InterlockedIncrement(&requests_bcpack_blank);
                     InterlockedIncrement(&bcpack_blank[bcpack]);
@@ -813,6 +877,23 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     if (!empty) count_page_request(request, failed);
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
+    static const bool trace_failures = x2w_local::env_on("X2W_DSTORAGE_TRACE_FAILURES");
+    static LONG traced_failures;
+    if (failed && trace_failures && InterlockedIncrement(&traced_failures) <= 12) {
+        wchar_t path[1024]{};
+        DWORD length = 0;
+        if (!memory_source && source && !(options & ~known)) {
+            const auto* file_object = reinterpret_cast<const Object*>(source);
+            if (file_object->kind == file)
+                length = GetFinalPathNameByHandleW(file_object->handle, path, 1024, FILE_NAME_NORMALIZED);
+        }
+        const unsigned declared_size = *reinterpret_cast<const unsigned*>(request + 0x38);
+        log("x2w-dstorage first failures: file=%ls offset=0x%llx stored=%u wanted=%u declared=%u "
+            "decoded=%zu page_offset=%u zlib=%u bcpack=%u cause=%s",
+            length && length < 1024 ? path : (memory_source ? L"(memory)" : L"(unavailable)"),
+            offset, source_size, destination_size, declared_size, decode_length, page_offset,
+            unsigned(zlib), bcpack, outcome);
+    }
     if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
         log("x2w-dstorage   options=0x%llx dest=%p dest_size=0x%x source=0x%llx offset=0x%llx size=0x%x -> %s", options,
             static_cast<void*>(destination), destination_size, source, offset, source_size, outcome);
@@ -1496,9 +1577,9 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                 // Heartbeat preserves "inflated=%ld" format string for tools/startup/live_view.py;
                 // requests_compressed counts all compressed streams (zlib and standalone/embedded BCPack).
                 log("x2w-dstorage heartbeat %d s: requests done=%ld inflated=%ld failed=%ld bcpack-blank=%ld; page tokens 0 at enqueue=%ld, "
-                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s", second, requests_done, requests_compressed,
+                    "still 0 at run=%ld, replaced after enqueue=%ld; %s, live physical-page sections=%s; metadata-windows=%ld", second, requests_done, requests_compressed,
                     failed, requests_bcpack_blank, zero_tokens_at_enqueue, zero_tokens_at_run, tokens_replaced_after_enqueue, memory,
-                    section_text);
+                    section_text, requests_metadata_windows);
                 char causes[384];
                 if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
                 char ends[384];

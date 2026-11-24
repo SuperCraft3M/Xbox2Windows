@@ -1,10 +1,11 @@
 """Run one EXE under a minimal debugger inside a kill-on-close job (startup diagnostics; see docs/startup-runtime.md).
 
-usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1]
+usage: debug_launch.py <exe> <cwd> <logdir> [--timeout S] [--memory-gib N] [--stop-first-chance 1] [--suspend-others 0]
 
 Records module loads, every exception (code, address as module+offset, first/second chance) and, for
 the stopping exception, the integer registers, the stack words and the code bytes around RIP.
-Stops at the first second-chance exception, at a breakpoint inside the main image, or at the timeout.
+Stops at a second-chance exception, an uncontinued main-image breakpoint, or the timeout.
+A timeout of zero disables the timer. An assertion continuation limit of -1 removes that limit.
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -17,9 +18,13 @@ k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
+k32.SuspendThread.restype = wt.DWORD
+nt_dll = ctypes.WinDLL("ntdll")
+nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
+from hook_window import StepWindow, ReturnBook, classify_hold, classify_status, GONE, HELD  # noqa: E402
 
 EXCEPTION, CREATE_THREAD, CREATE_PROCESS, EXIT_THREAD, EXIT_PROCESS, LOAD_DLL, UNLOAD_DLL, OUTPUT_STRING, RIP = range(1, 10)
 DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED = 0x00010002, 0x80010001
@@ -51,10 +56,13 @@ def main():
     def print(*args, **kwargs):
         summary.append(" ".join(str(a) for a in args))
         builtins.print(*args, **kwargs)
-    timeout = float(opts.get("--timeout", 15))
+    timeout = float(opts.get("--timeout", 15))  # zero leaves the session running until exit or a debug stop
     memory = int(float(opts.get("--memory-gib", 16)) * 2**30)
     stop_first = opts.get("--stop-first-chance") == "1"
-    skip_asserts = int(opts.get("--continue-asserts", "0"))  # main-image int3s to log and continue past
+    skip_asserts = int(opts.get("--continue-asserts", "0"))  # -1 continues all diagnostic assertions
+    if timeout < 0 or not timeout < float("inf") or skip_asserts < -1:
+        print("expected a finite nonnegative timeout and an assertion limit of -1 or greater")
+        return 2
     asserts_seen = {}
     # X2W_HOST_CPU=1: rewrite main-image instructions the host processor lacks (host_cpu.py).
     host_cpu_on = os.environ.get("X2W_HOST_CPU") == "1"
@@ -248,6 +256,97 @@ def main():
         text = ustr(name) if name else ""
         return (f"[root {root:#x}]" if root else "") + text
 
+    def oa_string(addr):  # the UNICODE_STRING* inside OBJECT_ATTRIBUTES, for rewriting it
+        raw = read(addr, 24)
+        return struct.unpack_from("<Q", raw, 16)[0] if len(raw) >= 24 else 0
+
+    # --map-drive G=C:\folder[;S=D:\folder]: a console executable opens its package at a fixed drive
+    # letter, so a package that sits on another volume never mounts. The file hooks rewrite the path
+    # of an open on a mapped letter to the real folder, in the caller's own UNICODE_STRING.
+    drive_map = {}
+    # Rewritten names live in buffers borrowed for the duration of one hooked call, so two calls that
+    # overlap on different threads cannot overwrite or free each other's name. A buffer goes back to
+    # the pool when that call's name is restored, so a serial run reuses one buffer instead of
+    # allocating per open and the allocation count does not follow the number of opens.
+    name_pool = {"free": [], "allocations": 0}
+    for item in filter(None, opts.get("--map-drive", "").split(";")):
+        letter, _, folder = item.partition("=")
+        letter = letter.strip().rstrip(":").upper()
+        # Letters are ASCII A-Z: isalpha() alone also accepts non-ASCII letters, which no NT path has.
+        if len(letter) == 1 and letter.isascii() and letter.isalpha() and folder.strip():
+            # NT paths take backslashes; the option may arrive with either separator.
+            drive_map[letter] = folder.strip().rstrip("\\/").replace("/", "\\")
+
+    def map_drive(text, string_address):
+        """Makes the call's name temporary: returns (new text, restore) or (None, None).
+
+        The caller's UNICODE_STRING is changed only for the duration of the hooked call; restore()
+        puts back its length, buffer pointer and contents when the call returns."""
+        if not drive_map or not string_address:
+            return None, None
+        body = text
+        # oa_name() marks a root-relative name with a "[root 0x...]" tag for the log. That tag is not
+        # part of the name, so it is dropped here and never written into the caller's UNICODE_STRING.
+        if body.startswith("[root ") and "]" in body:
+            body = body[body.index("]") + 1:]
+        prefix = ""
+        for candidate in ("\\??\\", "\\\\.\\", "\\\\?\\"):
+            if body.upper().startswith(candidate):
+                prefix, body = body[:len(candidate)], body[len(candidate):]
+                break
+        if len(body) < 2 or body[1] != ":" or body[0].upper() not in drive_map:
+            return None, None
+        replacement = prefix + drive_map[body[0].upper()] + body[2:]
+        raw = read(string_address, 16)
+        if len(raw) < 16:
+            return None, None
+        _, maximum, buffer = struct.unpack_from("<HH4xQ", raw)
+        encoded = replacement.encode("utf-16-le")
+        # A UNICODE_STRING length is a USHORT, so a longer name cannot be expressed at all.
+        if not 0 < len(encoded) <= 0xFFFF:
+            return None, None
+        if len(encoded) <= maximum:
+            original = read(buffer, len(encoded))
+            if len(original) != len(encoded) or not write(buffer, encoded):
+                return None, None
+            if not write(string_address, struct.pack("<H", len(encoded))):
+                write(buffer, original)
+                return None, None
+            return replacement, lambda: (write(buffer, original), write(string_address, raw))
+        # The replacement is longer than the caller's buffer, which is the common case: a folder path
+        # against a single letter. Borrow a buffer from the pool for this call only; it is returned
+        # when the name is restored, so serial opens reuse one buffer but overlapping calls get their
+        # own.
+        address, capacity = 0, 0
+        for index, (candidate, room) in enumerate(name_pool["free"]):
+            if room >= len(encoded):
+                address, capacity = name_pool["free"].pop(index)
+                break
+        if not address:
+            k32.VirtualAllocEx.restype = ctypes.c_void_p
+            k32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+            fresh = k32.VirtualAllocEx(wt.HANDLE(pi.hProcess), None, len(encoded), 0x3000, 0x04)
+            if not fresh:
+                return None, None
+            address, capacity = fresh, len(encoded)
+            name_pool["allocations"] += 1
+            if file_log:
+                file_log.write(f"{time.time() - start:7.3f} NAMEBUF alloc {len(encoded)} bytes at {fresh:#x} "
+                               f"(live {name_pool['allocations']})\n")
+                file_log.flush()
+        if not write(address, encoded):
+            name_pool["free"].append((address, capacity))
+            return None, None
+        if not write(string_address, struct.pack("<HH4xQ", len(encoded), len(encoded), address)):
+            name_pool["free"].append((address, capacity))
+            return None, None
+
+        def restore():
+            write(string_address, raw)
+            name_pool["free"].append((address, capacity))
+
+        return replacement, restore
+
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
     k32.GetModuleHandleW.restype = wt.HMODULE
     ntdll = k32.GetModuleHandleW("ntdll.dll")
@@ -336,8 +435,61 @@ def main():
         print(f"  bink luma plane -> bink_luma.png (pointer {pointer:#x}, pitch {pitch})")
 
     breakpoints = {}  # addr -> original byte
-    returns = {}  # addr -> list of (tid, rsp after return, description)
+    returns = ReturnBook()
     stepping = {}  # tid -> addr to re-arm
+    hook_entries = [0]
+    held_threads = {}  # tid -> handle of a thread held for the current step window
+    os_handles = {}  # tid -> hThread of CREATE_*_DEBUG_EVENT: valid until its EXIT_THREAD is continued; never closed here
+    sync_raw = (ctypes.c_ubyte * (1232 + 16))()
+    sync_addr = (ctypes.addressof(sync_raw) + 15) & ~15
+
+    def hold_thread(tid):
+        handle = os_handles.get(tid)
+        owned = handle is None
+        if owned:  # SUSPEND_RESUME | GET_CONTEXT | QUERY_INFORMATION | SYNCHRONIZE
+            handle = k32.OpenThread(0x0002 | 0x0008 | 0x0040 | 0x00100000, False, tid)
+            if not handle:
+                return classify_hold(None, ctypes.get_last_error())
+
+        def drop():
+            if owned:
+                k32.CloseHandle(wt.HANDLE(handle))
+
+        # SuspendThread returns before the thread has stopped; GetThreadContext waits until it has.
+        struct.pack_into("<I", (ctypes.c_ubyte * 1232).from_address(sync_addr), 0x30, 0x100001)
+        previous = wt.ULONG()
+        status = nt_dll.NtSuspendThread(wt.HANDLE(handle), ctypes.byref(previous))
+        suspended = status == 0
+        if suspended and k32.GetThreadContext(wt.HANDLE(handle), ctypes.c_void_p(sync_addr)):
+            held_threads[tid] = (handle, owned)
+            return HELD
+        if suspended:
+            k32.ResumeThread(wt.HANDLE(handle))
+        # A thread already exiting (waiting for its EXIT_THREAD event) refuses suspension with
+        # STATUS_THREAD_IS_TERMINATING while GetExitCodeThread still says STILL_ACTIVE: it runs no code.
+        if not suspended and classify_status(status) == GONE:
+            drop()
+            return GONE
+        # Classify after the failure: a thread that has called ExitThread is GONE (no code left to race
+        # with); a live thread that cannot be suspended stays FAILED and the window reports it.
+        code = wt.DWORD()
+        exit_code = code.value if k32.GetExitCodeThread(wt.HANDLE(handle), ctypes.byref(code)) else None
+        # A thread that is terminating may not have its exit code yet: its handle is signaled in moments.
+        signaled = k32.WaitForSingleObject(wt.HANDLE(handle), 20) == 0
+        drop()
+        return classify_hold(exit_code, signaled=signaled)
+
+    def release_thread(tid):
+        held = held_threads.pop(tid, None)
+        if held:
+            handle, owned = held
+            k32.ResumeThread(wt.HANDLE(handle))
+            if owned:
+                k32.CloseHandle(wt.HANDLE(handle))
+
+    # A hook step-over restores the original byte for one instruction. Every other thread is held
+    # for that step (--suspend-others 0 turns this off to measure what the window costs).
+    window = StepWindow(hold_thread, release_thread, protect=opts.get("--suspend-others", "1") != "0")
     file_log = open(os.path.join(logdir, "files.txt"), "w", encoding="utf-8") if trace else None
 
     def arm(addr):
@@ -351,11 +503,22 @@ def main():
         thread, ctx = get_ctx(tid)
         if not thread:
             return False
+        if window.defer(tid):
+            # This thread trapped before it was held. Back to the hook address: it traps again, and
+            # is traced, once the window is closed and the byte is patched again.
+            struct.pack_into("<Q", ctx, 0xF8, addr)
+            set_ctx(thread)
+            return True
         regs = dict(zip(REGS, struct.unpack_from("<16Q", ctx, 0x78) + struct.unpack_from("<Q", ctx, 0xF8)))
         rsp = regs["Rsp"]
         if addr in hooks:
+            hook_entries[0] += 1
             name, arg = hooks[addr]
-            ret = read_qword(read, rsp) or 0
+            ret = struct.unpack("<Q", read(rsp, 8) or b"\0" * 8)[0]
+            # Every kind of trace reaches the common "if desc:" below, so the restore callback is
+            # initialised here: leaving it to the file-name branch would let a non-name trace see an
+            # unbound name or carry over the previous call's callback.
+            restore = None
             if arg == "valloc":
                 # NtAllocateVirtualMemory(process, &base, zero bits, &size, type, protect) and
                 # NtAllocateVirtualMemoryEx(process, &base, &size, type, protect, ...).
@@ -403,10 +566,29 @@ def main():
                 desc = bink_call(name, regs, ret)
             else:
                 if arg.startswith("ustr:"):
-                    target = ustr(regs[arg[5:].capitalize()])
+                    string_address = regs[arg[5:].capitalize()]
+                    target = ustr(string_address)
                 else:
-                    target = oa_name(regs[arg.capitalize()] if arg != 'r8' else regs['R8'])
-                desc = f"{name} {target} from {where(ret)}"
+                    oa_address = regs['R8'] if arg == 'r8' else regs[arg.capitalize()]
+                    target = oa_name(oa_address)
+                    string_address = oa_string(oa_address)
+                if offline and any(pattern in target.lower() for pattern in OFFLINE_DENY):
+                    # Offline mode: the call never runs, so the caller's name is left untouched.
+                    denied[target] = denied.get(target, 0) + 1
+                    file_log.write(f"{time.time() - start:7.3f} DENIED (offline) {name} {target} "
+                                   f"from {where(ret)}\n")
+                    file_log.flush()
+                    struct.pack_into("<Q", ctx, 0x78, 0xC0000022)   # rax
+                    struct.pack_into("<Q", ctx, 0x98, rsp + 8)      # rsp: pop the return address
+                    struct.pack_into("<Q", ctx, 0xF8, ret)          # rip
+                    set_ctx(thread)
+                    return True
+                mapped, restore = map_drive(target, string_address)
+                desc = f"{name} {mapped or target} from {where(ret)}"
+                if mapped:
+                    desc += " (mapped from " + target + ")"
+                    file_log.write(f"{time.time() - start:7.3f} MAP {target} -> {mapped}\n")
+                    file_log.flush()
                 if offline and any(pattern in target.lower() for pattern in OFFLINE_DENY):
                     # Offline mode: the call never runs. Return STATUS_ACCESS_DENIED to the caller.
                     denied[target] = denied.get(target, 0) + 1
@@ -424,14 +606,15 @@ def main():
                 chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                 desc += " callers: " + " ".join(chain[:8])
             if desc:
-                returns.setdefault(ret, []).append((tid, rsp + 8, desc))
+                returns.add(ret, tid, rsp + 8, (desc, restore), addr)
                 arm(ret)
-        for item in list(returns.get(addr, [])):
-            if item[0] == tid and item[1] == rsp:
-                returns[addr].remove(item)
-                file_log.write(f"{time.time() - start:7.3f} {item[2]} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
-                file_log.flush()
-        # Step over the original instruction, then re-arm.
+        for description, restore in returns.take(addr, tid, rsp):
+            if restore:
+                restore()
+            file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")
+            file_log.flush()
+        # Step over the original instruction, then re-arm. Everyone else is held until the step is done.
+        window.open(tid, [other for other in live_threads if other != tid], time.monotonic())
         struct.pack_into("<Q", ctx, 0xF8, addr)
         eflags = struct.unpack_from("<I", ctx, 0x44)[0]
         struct.pack_into("<I", ctx, 0x44, eflags | 0x100)
@@ -503,19 +686,23 @@ def main():
                 watch_values[rva] = blob
                 log(f"{time.time() - start:7.3f} watch +{rva:#x} = {blob.hex(' ')}")
 
-    while time.time() - start < timeout:
+    while not timeout or time.time() - start < timeout:
         if dump_at and time.time() - start >= dump_at[0]:
             dump_threads(os.path.join(logdir, f"threads_{dump_at.pop(0):g}.txt"))
         if watches and time.time() >= watch_next:
             watch_next = time.time() + 1.0
             poll_watches()
+        if window.expire(time.monotonic()):
+            log(f"{time.time() - start:7.3f} hook step window expired, held threads resumed")
         if not k32.WaitForDebugEvent(event, 200):
             continue
         code, pid, tid = struct.unpack_from("<III", event, 0)
         status = DBG_CONTINUE
         if code == CREATE_PROCESS:
             live_threads.add(tid)
-            h_file, _, _, base = struct.unpack_from("<QQQQ", event, 16)
+            h_file, _, h_thread, base = struct.unpack_from("<QQQQ", event, 16)
+            if h_thread:
+                os_handles[tid] = h_thread
             main_base = base
             for item in filter(None, os.environ.get("X2W_COUNT", "").split(",")):
                 hooks[base + int(item, 16)] = (f"+{item}", "count")
@@ -561,8 +748,14 @@ def main():
         elif code == CREATE_THREAD:
             log(f"{time.time() - start:7.3f} thread {tid} created")
             live_threads.add(tid)
+            h_thread = struct.unpack_from("<Q", event, 16)[0]
+            if h_thread:
+                os_handles[tid] = h_thread
+            window.hold(tid)
         elif code == 4:  # EXIT_THREAD
             live_threads.discard(tid)
+            window.finish(tid)
+            os_handles.pop(tid, None)
         elif code == EXIT_PROCESS:
             exit_code = struct.unpack_from("<I", event, 16)[0]
             log(f"{time.time() - start:7.3f} exit {exit_code:#010x}")
@@ -586,6 +779,7 @@ def main():
                 addr = stepping.pop(tid)
                 if addr in breakpoints:
                     write(addr, b"\xcc")
+                window.finish(tid)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
                 continue
             if (ex_code == 0xC000001D and first and host_cpu_on and not stop_first and main_base
@@ -606,7 +800,8 @@ def main():
                 for addr in hooks:
                     arm(addr)
             elif (ex_code == 0x80000003 and first and main_base and main_base <= ex_addr < main_base + 0x10000000
-                  and sum(asserts_seen.values()) < skip_asserts and (ex_addr - main_base) not in stop_at):
+                  and (skip_asserts == -1 or sum(asserts_seen.values()) < skip_asserts)
+                  and (ex_addr - main_base) not in stop_at):
                 asserts_seen[ex_addr] = asserts_seen.get(ex_addr, 0) + 1
                 status = DBG_CONTINUE  # rip is already past the int3
             elif (not first) or stop_first or (ex_code == 0x80000003 and main_base and
@@ -619,6 +814,7 @@ def main():
                 status = DBG_EXCEPTION_NOT_HANDLED
         k32.ContinueDebugEvent(pid, tid, status)
 
+    window.abandon()
     elapsed = time.time() - start
     if stop and stop_at:
         dump_threads(os.path.join(logdir, "threads_stop.txt"))
@@ -725,6 +921,11 @@ def main():
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
                                            for item in os.environ["X2W_COUNT"].split(",") if item))
+    report = window.summary(hook_entries[0])
+    print("  " + report)
+    if file_log:
+        file_log.write(report + "\n")
+        file_log.flush()
     if offline:
         print(f"  offline: {sum(denied.values())} network opens refused" +
               ("" if not denied else " (" + ", ".join(f"{k} x{v}" for k, v in list(denied.items())[:6]) + ")"))

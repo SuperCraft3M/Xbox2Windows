@@ -1,6 +1,7 @@
 """Live debug console for a run: follows the run's logs and prints what the title is doing.
 
 usage: live_view.py <rundir> [<package root>]      (started in its own console window by debug_launch.py)
+       live_view.py --status <rundir>             (storage and presentation counters only)
 
 It only reads the log files the debugger and the stand-in DLLs write; it does not touch the game.
 File opens are shown for paths on the G: mount and under the package root, if one is given.
@@ -10,15 +11,23 @@ import re
 import sys
 import time
 
+from live_progress import LiveProgress
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+status_only = sys.argv[1:2] == ["--status"]
+if status_only:
+    del sys.argv[1]
 rundir = sys.argv[1]
 # The package root the run uses as its working directory (run.ps1 -DataDir), next to the G:\ mount.
 roots = ["G:\\"] + [os.path.join(os.path.abspath(sys.argv[2]), "")] if len(sys.argv) > 2 else ["G:\\"]
 game_file = re.compile(r"Nt(?:CreateFile|OpenFile) (?:\\\?\?\\)?((?i:" + "|".join(map(re.escape, roots)) + r").+)(?= from (?:[^+]*\+)?0x[0-9a-fA-F]+ )")
-os.system("title Xbox2Windows debug log - " + os.path.basename(os.path.abspath(rundir)))
-start = time.time()
+if os.name == "nt":
+    import ctypes
+    label = "live status" if status_only else "debug log"
+    ctypes.windll.kernel32.SetConsoleTitleW(f"Xbox2Windows {label} - {os.path.basename(os.path.abspath(rundir))}")
+start = time.monotonic()
 counts = {"modules": 0, "files": 0, "refused": 0, "chunks": 0, "gpu calls first seen": 0}
 last_status = 0.0
 state = "?"
@@ -26,7 +35,7 @@ frames = "0"
 
 
 def say(tag, text):
-    print(f"{time.time() - start:7.1f}s  {tag:<9} {text}", flush=True)
+    print(f"{time.monotonic() - start:7.1f}s  {tag:<9} {text}", flush=True)
 
 
 def on_event(line):
@@ -95,7 +104,7 @@ def on_shim(line):
         m = re.search(r"heartbeat: (\d+) frames presented in ([\d.]+) s \(([\d.]+) fps", line)
         if m:
             frames = m.group(1)
-            say("frames", f"{m.group(1)} frames presented, {m.group(3)} fps (every draw dropped: no GPU translation yet)")
+            say("frames", f"{m.group(1)} frames presented, {m.group(3)} fps overall")
     elif "title main state" in line:
         m = re.search(r"state (-?\d+) -> (-?\d+)", line)
         if m:
@@ -118,11 +127,22 @@ def on_shim(line):
         say("texture", line[7:150])
 
 
-sources = {"events.txt": on_event, "files.txt": on_file, "trap.log": on_shim}
+progress = LiveProgress(start)
+initial_poll = True
+
+
+def on_progress(line):
+    progress.observe(line, time.monotonic(), historical=initial_poll)
+
+
+sources = {"stderr.txt": on_progress} if status_only else {"events.txt": on_event, "files.txt": on_file, "trap.log": on_shim}
 positions = {name: 0 for name in sources}
 partial = {name: b"" for name in sources}  # bytes: a character can be split between two reads
-print("Xbox2Windows local startup experiment: live log of " + os.path.abspath(rundir))
-print("Columns: time since this window opened, category, detail. The game runs offline (network opens are refused).")
+print("Xbox2Windows local startup experiment: " + os.path.abspath(rundir))
+if status_only:
+    print("Activity is measured from the time this window opens. Closing it leaves the run alone.")
+else:
+    print("Columns: time since this window opened, category, detail. The game runs offline (network opens are refused).")
 print("-" * 110, flush=True)
 finished = os.path.join(rundir, "finished.txt")
 ended = False
@@ -147,11 +167,18 @@ while True:
                 handler(raw.decode("utf-8", errors="replace").rstrip("\r"))
             except Exception as error:  # a viewer bug must not hide the rest of the log
                 say("viewer", f"could not format a line: {error}")
-    if time.time() - last_status >= 10 and not ended:
-        last_status = time.time()
-        say("status", f"state {state}, {frames} frames, {counts['modules']} modules, {counts['files']} game-file opens, "
-                      f"{counts['chunks']} chunks decompressed, {counts['refused']} network opens refused, "
-                      f"{counts.get('handled probes', 0)} handled probes")
+    initial_poll = False
+    now = time.monotonic()
+    if (not last_status or now - last_status >= 10) and not ended:
+        last_status = now
+        if status_only:
+            storage, present = progress.describe(now)
+            say("storage", storage)
+            say("present", present)
+        else:
+            say("status", f"state {state}, {frames} frames, {counts['modules']} modules, {counts['files']} game-file opens, "
+                          f"{counts['chunks']} chunks decompressed, {counts['refused']} network opens refused, "
+                          f"{counts.get('handled probes', 0)} handled probes")
     if ended and not progressed:
         break
     if os.path.exists(finished):
@@ -163,7 +190,7 @@ try:
     print(open(finished, encoding="utf-8", errors="replace").read().strip())
 except OSError:
     pass
-print("\nRun ended. Full logs are in " + os.path.abspath(rundir) + " (events.txt, files.txt, trap.log).")
+print("\nRun ended. Full logs are in " + os.path.abspath(rundir) + " (stderr.txt, events.txt, files.txt, trap.log).")
 # Closes by itself (the full logs stay in the run folder).
 for left in range(10, 0, -1):
     print(f"\rThis window closes in {left} s ", end="", flush=True)

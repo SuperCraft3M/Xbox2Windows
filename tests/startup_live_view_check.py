@@ -1,4 +1,4 @@
-"""Check that tools/startup/live_view.py shows a log line intact when a read ends inside a character.
+"""Check partial log writes and the independent storage and presentation progress summaries.
 
 The debugger and the stand-in DLLs append to files.txt while the viewer polls it. A path with a
 non-ASCII character can be flushed in two pieces, so one poll ends between the bytes of one UTF-8
@@ -17,6 +17,9 @@ import tempfile
 import time
 
 VIEW = Path(__file__).resolve().parents[1] / "tools/startup/live_view.py"
+sys.path.insert(0, str(VIEW.parent))
+from live_progress import LiveProgress
+
 TAIL = b" from 0x1000 -> 0x00000000"
 
 
@@ -55,7 +58,60 @@ def shown_files(first, second, newline):
     )
 
 
+def check_progress():
+    activity = LiveProgress(100)
+    assert activity.describe(100) == ("waiting for a storage sample", "waiting for a presentation sample")
+    activity.observe("x2w-dstorage heartbeat 10 s: requests done=1 inflated=2 failed=0 bcpack-blank=0", 100, historical=True)
+    activity.observe("x2w-dstorage heartbeat 20 s: requests done=3 inflated=4 failed=0 bcpack-blank=0", 100, historical=True)
+    activity.observe("x2w-d3d12 heartbeat: 10 frames presented in 1.0 s (10.0 fps overall)", 100, historical=True)
+    assert all("observing for an increase" in summary for summary in activity.describe(100))
+
+    activity.observe("x2w-dstorage heartbeat 30 s: requests done=3 inflated=7 failed=0 bcpack-blank=1", 110)
+    activity.observe("x2w-render presented surface 128x128 format 28, readback 40, mean level 36.00/255", 111)
+    active, present = activity.describe(111)
+    assert "active" in active and "(3 plain, 7 compressed, 0 failed, 1 blank BCPack)" in active, active
+    assert "observing" in present and "last surface mean 36.00/255" in present, present
+
+    # A memory heartbeat, failed request, status enqueue, or new frame cannot renew the storage activity.
+    activity.observe("x2w-dstorage heartbeat 60 s: requests done=3 inflated=7 failed=0 bcpack-blank=1; commit peak=12 MiB", 138)
+    activity.observe("x2w-dstorage Queue::EnqueueStatus index=0 (requests done=80 inflated=900 failed=0)", 139)
+    activity.observe("x2w-dstorage heartbeat 70 s: requests done=3 inflated=7 failed=1 bcpack-blank=1", 140)
+    activity.observe("x2w-d3d12 heartbeat: 30 frames presented in 3.0 s (10.0 fps overall)", 141)
+    storage, presenting = activity.describe(142)
+    assert "no increase for 32 s" in storage and "1 failed" in storage, storage
+    assert "active" in presenting and "30 frames" in presenting, presenting
+    assert "no increase for 31 s" in activity.describe(172)[1]
+
+    activity.observe("x2w-dstorage heartbeat 90 s: requests done=4 inflated=7 failed=1 bcpack-blank=1", 175)
+    assert "active" in activity.describe(176)[0]
+    print("live status distinguishes observed storage progress, failed requests, quiet storage and presentations")
+
+
+def check_status_console():
+    with tempfile.TemporaryDirectory() as run:
+        Path(run, "stderr.txt").write_text(
+            "x2w-dstorage heartbeat 10 s: requests done=3 inflated=4 failed=1 bcpack-blank=1\n"
+            "x2w-d3d12 heartbeat: 12 frames presented in 2.0 s (6.0 fps overall)\n",
+            encoding="utf-8",
+        )
+        with subprocess.Popen([sys.executable, "-B", str(VIEW), "--status", run], stdout=subprocess.PIPE,
+                              text=True, encoding="utf-8") as viewer:
+            lines = []
+            try:
+                for line in viewer.stdout:
+                    lines.append(line)
+                    if " present " in line:
+                        break
+            finally:
+                viewer.kill()
+                viewer.wait()
+    assert any("3 plain, 4 compressed, 1 failed, 1 blank BCPack" in line for line in lines), lines
+    assert any("12 frames, 6.0 fps overall" in line for line in lines), lines
+
+
 def main():
+    check_progress()
+    check_status_console()
     for newline in (b"\n", b"\r\n"):
         shown = shown_files(b"caf\xc3", b"\xa9.bin", newline)
         if len(shown) != 1 or not shown[0].rstrip().endswith("G:\\caf\u00e9.bin"):

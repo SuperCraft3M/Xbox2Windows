@@ -402,6 +402,40 @@ Then:
 It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment exists, because
 `-HostCpu` needs `iced-x86` from `requirements-dev.txt`; otherwise it falls back to `python` from
 `PATH`.
+
+
+### Package on another volume
+
+A console executable opens its package at a fixed drive letter, so a package that lives on another
+volume never mounts: the first open returns "not found", nothing is mounted, and the run usually
+stops within a second on a table sized from data that was never loaded. `-MapDrive` rewrites opens on
+a mapped letter to the real folder, in the caller's own path structure and inside the debugger's
+existing file hook, so the letter does not have to be free and a real volume on it is not disturbed:
+
+```powershell
+.\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `
+    -MapDrive "G=D:\package"
+```
+
+The value is `LETTER=FOLDER`, and several mappings are separated by `;`. The debugger logs a `MAP`
+line for each rewrite and the rewritten path in `<log>/files.txt`. An open on a letter that is not
+mapped is left untouched. The rewritten name is borrowed for the hooked call only: the caller's
+`UNICODE_STRING` is restored (length, buffer pointer and contents) when the call returns, so a
+failure or a retry sees the name it built. When the replacement does not fit the caller's buffer the
+debugger borrows a name buffer for the duration of that call and returns it to a pool on restore, so
+serial opens reuse one buffer instead of allocating per open and overlapping calls do not share one.
+Two limits remain. Only opens that pass through the file hooks are rewritten, so a title that reads
+its package through a memory-mapped API is not covered. And the hooks are one patched byte per
+function, so a call that enters the same hooked function while another is being stepped over runs
+untraced and keeps its unmapped name — measured as 40 to 46 of 64 concurrent opens rewritten; see
+[#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281). `startup_map_drive` covers the rewrite, the
+negative control without the option, that an unmapped letter is left alone, and one caller-owned
+`UNICODE_STRING` reused across 32 serially opened files with its length, buffer pointer and contents
+checked after every return and a single name buffer. With hook step-window protection,
+`startup_map_drive_overlap` is a required pass: both threads must complete all 64 opens while
+retaining their caller-owned names. The return book carries each trace together with its
+name-restoration callback, so restoring the path still happens before the caller resumes.
+
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
 
@@ -444,7 +478,12 @@ did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_
 runs the script on a stub debugger under Windows PowerShell and `pwsh`, elsewhere it checks the
 script text only.
 
-`tools/startup/live_view.py` follows a run in a second console. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
+`tools/startup/live_view.py` follows a run in a second console. To attach a compact status view to an
+existing session, run `python -B tools/startup/live_view.py --status out/startup/<run>`.
+It reports DirectStorage completions, failures and presentation activity independently. After 30 seconds
+without an observed increase, the corresponding counter is marked quiet. Quiet storage can mean completed
+work or waiting. Frames presented and the mean of the last sampled surface provide no gameplay verdict.
+The view reads the log and can be closed independently of the run. `X2W_TRAP_DUMP="exe+RVA:len,reg+off:len"`
 adds memory dumps to the stop report.
 
 `tools/startup/triage_run.py` summarizes a log directory (and optional `--shader-cache <dir>`)
@@ -583,6 +622,31 @@ second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAG
 ```powershell
 cmake --build --preset dev --target startup_local_log_check startup_local_log_cache_failure_check
 ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control|_reopen_control|_cache_failure_control)?$' -V
+```
+
+## Concurrent calls through a hooked function
+
+The debugger's file, socket and allocation hooks are one patched byte per function. To run the original
+instruction it restores the byte, single-steps the thread that hit it and patches the byte again. A second thread that
+entered the function inside that window ran untraced, so `files.txt` could miss opens and the
+offline mode could miss a refused socket. Now every other thread is held for the step and resumes when the stepping
+thread is done (`tools/startup/hook_window.py`). A thread that had already trapped when it was held goes back to the
+hook address and traps again afterwards, so its call is traced once, not twice. Each window has a 2 s deadline, so a
+thread is never held forever. Per-thread state of a call in flight (the return address and stack pointer it will come back to) is
+keyed by thread id, not shared.
+
+Every run ends with `hook windows: entries=N windows=W unprotected=U deferred=D timeouts=T protection=on|off` in the
+console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` (`U`) counts the exposed step windows in which another thread could
+not be held (a thread that has already exited is not counted: it runs no code), or the deadline passed, or protection was off with other threads alive (one exposed window can miss multiple calls). `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
+
+`tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no
+Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: four threads
+enter `CreateFileW` together 16 times each on one file, and all 64 opens must show in `files.txt` with their result and
+`unprotected=0`. The control, `--suspend-others 0`, must lose opens and report `unprotected` above 0.
+
+```powershell
+cmake --build --preset dev --target startup_launch_probe
+ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 ```
 
 ## Trap-by-default header check
