@@ -465,7 +465,7 @@ def main():
                 chain = [c for c in chain if not c.lower().startswith(("ntdll", "kernelbase", "kernel32"))]
                 desc += " callers: " + " ".join(chain[:8])
             if desc:
-                returns.add(ret, tid, rsp + 8, desc)
+                returns.add(ret, tid, rsp + 8, desc, addr)
                 arm(ret)
         for description in returns.take(addr, tid, rsp):
             file_log.write(f"{time.time() - start:7.3f} {description} -> {regs['Rax'] & 0xFFFFFFFF:#010x}\n")

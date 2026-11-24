@@ -135,7 +135,7 @@ def traced_returns(retrapped):
     for call in range(32):
         for tid in (1, 2):
             for _ in range(2 if (call, tid) in retrapped else 1):
-                book.add(0x7000, tid, 0x1000 * tid, f"NtCreateFile call {call}")
+                book.add(0x7000, tid, 0x1000 * tid, f"NtCreateFile call {call}", 0x5000)
             lines += len(book.take(0x7000, tid, 0x1000 * tid))
     return lines
 
@@ -148,10 +148,18 @@ def returns_bookkeeping():
     assert traced_returns(set()) == 64
     assert traced_returns(retrapped) == 64, traced_returns(retrapped)
     book = ReturnBook()
-    book.add(0x10, 1, 0x100, "a")
-    book.add(0x10, 2, 0x100, "b")  # same slot value on another thread is another call
+    book.add(0x10, 1, 0x100, "a", 0x5000)
+    book.add(0x10, 2, 0x100, "b", 0x5000)  # same slot value on another thread is another call
     assert book.take(0x10, 1, 0x100) == ["a"] and book.take(0x10, 1, 0x100) == []
     assert book.take(0x10, 2, 0x100) == ["b"] and book.take(0x99, 2, 0x100) == []
+
+    # Tail-calling another hooked function shares (tid, slot) with a different entry address:
+    # both return records stay, while a re-trap of the same entry replaces only that entry.
+    book.add(0x20, 1, 0x200, "CreateFileW", 0x5000)
+    book.add(0x20, 1, 0x200, "NtCreateFile first", 0x6000)
+    book.add(0x20, 1, 0x200, "NtCreateFile retrapped", 0x6000)
+    assert book.take(0x20, 1, 0x200) == ["CreateFileW", "NtCreateFile retrapped"]
+    assert book.take(0x20, 1, 0x200) == []
 
 
 def run(probe, scratch, name, options):

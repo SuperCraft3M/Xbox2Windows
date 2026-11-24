@@ -34,22 +34,25 @@ def classify_hold(exit_code, error=0, signaled=False):
 class ReturnBook:
     """Pending hooked calls, keyed by return address; each is traced once, when its call returns.
 
-    A call is identified by its thread and the stack slot of its return address. The entry hook can
-    trap twice for one call when protection is off: another thread re-patches the byte before this
-    one has run the original instruction, so the thread traps again at the same address and slot.
-    That is the same call, so it replaces the first registration; two entries made the return write
-    two lines and a run counted 88 opens for 64 made."""
+    A call is identified by its thread, the stack slot of its return address, and the hooked entry
+    address. The entry hook can trap twice for one call when protection is off: another thread
+    re-patches the byte before this one has run the original instruction, so the thread traps again
+    at the same entry, thread and slot. That is the same call, so it replaces the first
+    registration; two entries made the return write two lines and a run counted 88 opens for 64
+    made. A hooked function that tail-calls another hooked function shares (tid, slot) with a
+    different entry address, so both registrations are kept."""
 
     def __init__(self):
-        self._pending = {}  # return address -> list of (tid, stack slot, description)
+        self._pending = {}  # return address -> list of (tid, stack slot, description, entry)
 
-    def add(self, address, tid, slot, description):
-        kept = [item for item in self._pending.get(address, []) if (item[0], item[1]) != (tid, slot)]
-        kept.append((tid, slot, description))
+    def add(self, address, tid, slot, description, entry=None):
+        kept = [item for item in self._pending.get(address, [])
+                if (item[0], item[1], item[3]) != (tid, slot, entry)]
+        kept.append((tid, slot, description, entry))
         self._pending[address] = kept
 
     def take(self, address, tid, slot):
-        """Descriptions of the call that returns here on this thread and slot (at most one)."""
+        """Descriptions of the calls that return here on this thread and slot."""
         items = self._pending.get(address, [])
         done = [item[2] for item in items if (item[0], item[1]) == (tid, slot)]
         if done:

@@ -255,9 +255,8 @@ thread is never held forever. Per-thread state of a call in flight (the return a
 keyed by thread id, not shared.
 
 Every run ends with `hook windows: entries=N windows=W unprotected=U deferred=D timeouts=T protection=on|off` in the
-console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` counts the windows in which another thread could
-not be held (a thread that has already exited is not counted: it runs no code), or the deadline passed, or protection was off with other threads alive: an upper bound on the calls a run may have
-missed. `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
+console output, `finished.txt` and `files.txt`, also when everything is 0. `unprotected` (`U`) counts the exposed step windows in which another thread could
+not be held (a thread that has already exited is not counted: it runs no code), or the deadline passed, or protection was off with other threads alive (one exposed window can miss multiple calls). `--suspend-others 0` turns the holding off, to measure what it costs or to see the loss.
 
 `tests/startup_hook_check.py` has two parts. `startup_hook_window` checks the bookkeeping with fake threads and needs no
 Windows. `startup_hook_overlap` runs the source-built `startup_launch_probe` in its `overlap` mode under the debugger: four threads
