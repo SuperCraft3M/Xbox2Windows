@@ -207,8 +207,10 @@ untraced and keeps its unmapped name — measured as 40 to 46 of 64 concurrent o
 [#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281). `startup_map_drive` covers the rewrite, the
 negative control without the option, that an unmapped letter is left alone, and one caller-owned
 `UNICODE_STRING` reused across 32 serially opened files with its length, buffer pointer and contents
-checked after every return and a single name buffer. `startup_map_drive_overlap` holds the two-thread
-control as an expected failure until the hooks stop dropping concurrent calls.
+checked after every return and a single name buffer. With hook step-window protection,
+`startup_map_drive_overlap` is a required pass: both threads must complete all 64 opens while
+retaining their caller-owned names. The return book carries each trace together with its
+name-restoration callback, so restoring the path still happens before the caller resumes.
 
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). It writes:

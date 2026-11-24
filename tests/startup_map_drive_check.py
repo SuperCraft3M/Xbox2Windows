@@ -88,10 +88,8 @@ if not ok:
     failures.append(f"reuse: stdout {stdout.strip()!r}, name allocations {name_buffers}, "
                     f"rewrites {trace.count('MAP ')}")
 
-# Two threads with their own caller-owned names in flight at once. This is a separate control: today
-# the launcher drops some concurrent hits on the same hooked function, so it is registered as an
-# expected failure (see CMakeLists) rather than a gate. It has to fail for the documented reason and
-# will start failing the suite once it passes, which is the signal to turn it into a normal gate.
+# Two threads with their own caller-owned names in flight at once. With hook step-window
+# protection both names must remain valid and all 64 opens must be rewritten.
 if len(sys.argv) > 4 and sys.argv[4] == "overlap":
     stdout, trace = run(letter, f"{letter}={package}", "map_overlap", mode="overlap")
     traced = trace.count("NtCreateFile")
