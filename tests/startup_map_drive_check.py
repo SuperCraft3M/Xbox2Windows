@@ -29,10 +29,12 @@ def free_letter():
     return None
 
 
-def run(letter, map_spec, log_name):
+def run(letter, map_spec, log_name, mode=""):
     log = os.path.join(scratch, log_name)
     shutil.rmtree(log, ignore_errors=True)
     env = dict(os.environ, X2W_PROBE_DRIVE=letter)
+    if mode:
+        env["X2W_PROBE_MODE"] = mode
     command = [python, "-B", launcher, consumer, scratch, log, "--timeout", "15", "--memory-gib", "2",
                "--trace-files", "1", "--continue-asserts", "0"]
     if map_spec:
@@ -74,6 +76,17 @@ ok = "MAP " not in trace
 print(f"unmapped letter C: {'ok' if ok else 'MISMATCH'}")
 if not ok:
     failures.append("an open on an unmapped letter was rewritten")
+
+# One caller-owned UNICODE_STRING through many opens: the borrowed name has to be given back after
+# every return, and the backing allocation must be reused rather than grown per open.
+stdout, trace = run(letter, f"{letter}={package}", "map_reuse", mode="reuse")
+name_buffers = trace.count("NAMEBUF alloc")
+ok = "reuse ok" in stdout and name_buffers <= 1 and trace.count("MAP ") >= 32
+print(f"reused caller name over 32 opens: {'ok' if ok else 'MISMATCH'} "
+      f"(name allocations={name_buffers}, rewrites={trace.count('MAP ')})")
+if not ok:
+    failures.append(f"reuse: stdout {stdout.strip()!r}, name allocations {name_buffers}, "
+                    f"rewrites {trace.count('MAP ')}")
 
 shutil.rmtree(package, ignore_errors=True)
 if failures:

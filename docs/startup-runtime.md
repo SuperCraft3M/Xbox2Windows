@@ -151,12 +151,16 @@ existing file hook, so the letter does not have to be free and a real volume on 
 
 The value is `LETTER=FOLDER`, and several mappings are separated by `;`. The debugger logs a `MAP`
 line for each rewrite and the rewritten path in `<log>/files.txt`. An open on a letter that is not
-mapped is left untouched. Two limits: only opens that pass through the file hooks the launcher
-already installs are rewritten, so a title that reads its package through a memory-mapped API rather
-than an open is not covered; and when the replacement is longer than the caller's buffer the launcher
-allocates the new name in the process and repoints the `UNICODE_STRING`, leaving that allocation to
-the process. `startup_map_drive` covers the rewrite, the negative control without the option, and
-that an unmapped letter is left alone.
+mapped is left untouched. The rewritten name is borrowed for the hooked call only: the caller's
+`UNICODE_STRING` is restored (length, buffer pointer and contents) when the call returns, so a
+failure or a retry sees the name it built. When the replacement does not fit the caller's buffer the
+debugger writes it into one backing allocation that is grown on demand and reused, so the number of
+name allocations does not follow the number of opens. One limit remains: only opens that pass through
+the file hooks the launcher already installs are rewritten, so a title that reads its package through
+a memory-mapped API rather than an open is not covered. `startup_map_drive` covers the rewrite, the
+negative control without the option, that an unmapped letter is left alone, and one caller-owned
+`UNICODE_STRING` reused across 32 opens with its length, buffer pointer and contents checked after
+every return and a single name allocation.
 
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not). It writes:
