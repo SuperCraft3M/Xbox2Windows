@@ -2,6 +2,24 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## UTF-8 persistent storage root
+
+The runtime proxy reads `X2W_STORAGE_PATH` with `GetEnvironmentVariableW` and converts it to
+UTF-8 before returning its narrow path. The former ANSI read could replace or misencode
+non-ASCII names on a desktop using a legacy code page. This follows the console UTF-8
+contract described in [Microsoft's GDK overview](https://learn.microsoft.com/gaming/gdk/docs/gdk-dev/overviews/utf-8).
+The 260-byte output capacity includes the terminator and any appended separator. Invalid
+UTF-16 or an expanded UTF-8 string that does not fit keeps the existing logged `S:\` fallback.
+
+`startup_storage_root` checks ASCII, accented and CJK names, a supplementary character,
+invalid UTF-16, empty inputs and UTF-8 byte expansion at the capacity boundary. The original
+separator control still must fail. This checks path conversion, not full executable startup.
+
+```powershell
+cmake --build --preset dev --target startup_storage_root_check startup_stub_gameinput
+ctest --preset dev --no-tests=error -R '^startup_storage_root' -V
+```
+
 ## Typed startup colour exports
 
 The [startup draw fixture](startup-runtime.md) uses a source-built gfx1013 pixel shader

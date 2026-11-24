@@ -12,6 +12,7 @@
 #include "startup_stubs/save_blob_pack.h"
 #include "startup_stubs/save_store.h"
 #include "startup_stubs/storage_root.h"
+#include "startup_stubs/storage_root_utf8.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -896,13 +897,14 @@ const char* storage_path()
     static char path[x2w_startup::storage_root_capacity];
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
     InitOnceExecuteOnce(&once, [](PINIT_ONCE, PVOID, PVOID*) -> BOOL {
-        char value[x2w_startup::storage_root_capacity + 1];
-        const DWORD length = GetEnvironmentVariableA("X2W_STORAGE_PATH", value, sizeof(value));
-        if (length >= sizeof(value))
+        wchar_t value[x2w_startup::storage_root_capacity + 1];
+        const DWORD capacity = static_cast<DWORD>(sizeof(value) / sizeof(*value));
+        const DWORD length = GetEnvironmentVariableW(L"X2W_STORAGE_PATH", value, capacity);
+        if (length >= capacity)
             x2w_local::logf("x2w-runtime X2W_STORAGE_PATH has %lu characters, more than the %zu supported: using S:\\",
                             static_cast<unsigned long>(length - 1), x2w_startup::storage_root_capacity - 2);
-        else if (length && !x2w_startup::storage_root(value, path))
-            x2w_local::logf("x2w-runtime X2W_STORAGE_PATH does not fit with its trailing separator: using S:\\");
+        else if (length && !x2w_startup::storage_root_utf8(value, path))
+            x2w_local::logf("x2w-runtime X2W_STORAGE_PATH is invalid UTF-16 or does not fit as UTF-8 with its trailing separator: using S:\\");
         if (!path[0]) std::strcpy(path, "S:\\");
         return TRUE;
     }, nullptr, nullptr);

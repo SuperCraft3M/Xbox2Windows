@@ -2,6 +2,7 @@
 // one separator, and a value that does not fit is refused instead of cut off.
 //   --mutate separator   the rule without the appended separator; must fail (negative control)
 #include "startup_stubs/storage_root.h"
+#include "startup_stubs/storage_root_utf8.h"
 
 #include <cstdio>
 #include <string>
@@ -38,6 +39,25 @@ void expect(const char* name, const char* value, const char* wanted)
 
 int main(int argc, char** argv)
 {
+    auto wide = [](const wchar_t* value, const char* expected) {
+        char out[x2w_startup::storage_root_capacity + 1];
+        std::memset(out, '#', sizeof(out));
+        const bool ok = x2w_startup::storage_root_utf8(value, out);
+        if ((expected ? (!ok || std::strcmp(out, expected)) : (ok || out[0] != '#')) ||
+            out[x2w_startup::storage_root_capacity] != '#') {
+            std::printf("FAIL UTF-16 to UTF-8 root conversion or capacity guard\n");
+            ++failures;
+        }
+    };
+    wide(L"C:\\saves", "C:\\saves\\");
+    wide(L"C:\\caf\u00e9\\\u6e38\u620f\\\U0001f3ae", "C:\\caf\xc3\xa9\\\xe6\xb8\xb8\xe6\x88\x8f\\\xf0\x9f\x8e\xae\\");
+    wide(nullptr, nullptr);
+    wide(L"", nullptr);
+    wide(L"\xd800", nullptr);
+    std::string utf8_limit;
+    for (int i = 0; i < 129; ++i) utf8_limit += "\xc3\xa9";
+    wide(std::wstring(129, L'\u00e9').c_str(), (utf8_limit + "\\").c_str());
+    wide(std::wstring(130, L'\u00e9').c_str(), nullptr);
     mutate = argc == 3 && !std::strcmp(argv[1], "--mutate") && !std::strcmp(argv[2], "separator");
     if (argc != 1 && !mutate) return 2;
     // The executable appends "settings\settings.xml" to the root as it is.
@@ -64,6 +84,6 @@ int main(int argc, char** argv)
         std::printf("startup_storage_root: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_storage_root: PASS (9 roots, 5 refusals)\n");
+    std::printf("startup_storage_root: PASS (9 roots, 5 refusals, 7 UTF-8 cases)\n");
     return 0;
 }
