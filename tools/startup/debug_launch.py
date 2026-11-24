@@ -18,8 +18,8 @@ k32.OpenThread.restype = wt.HANDLE
 k32.CreateJobObjectW.restype = wt.HANDLE
 k32.CreateFileW.restype = wt.HANDLE
 k32.SuspendThread.restype = wt.DWORD
-ntdll = ctypes.WinDLL("ntdll")
-ntdll.NtSuspendThread.restype = ctypes.c_ulong
+nt_dll = ctypes.WinDLL("ntdll")
+nt_dll.NtSuspendThread.restype = ctypes.c_ulong
 
 from launch import STARTUPINFOW, PROCESS_INFORMATION, EXTENDED_LIMIT, inheritable_file  # noqa: E402
 import host_cpu  # noqa: E402
@@ -359,7 +359,7 @@ def main():
         # SuspendThread returns before the thread has stopped; GetThreadContext waits until it has.
         struct.pack_into("<I", (ctypes.c_ubyte * 1232).from_address(sync_addr), 0x30, 0x100001)
         previous = wt.ULONG()
-        status = ntdll.NtSuspendThread(wt.HANDLE(handle), ctypes.byref(previous))
+        status = nt_dll.NtSuspendThread(wt.HANDLE(handle), ctypes.byref(previous))
         suspended = status == 0
         if suspended and k32.GetThreadContext(wt.HANDLE(handle), ctypes.c_void_p(sync_addr)):
             held_threads[tid] = (handle, owned)
