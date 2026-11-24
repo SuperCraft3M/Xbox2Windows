@@ -181,7 +181,7 @@ def run(probe, scratch, name, options):
     stdout = (logdir / "stdout.txt").read_text(encoding="utf-8", errors="replace")
     summary = re.search(r"hook windows: entries=\d+ windows=(\d+) unprotected=(\d+) deferred=\d+ timeouts=(\d+) "
                         r"protection=(on|off)", result.stdout + files)
-    assert summary, result.stdout
+    assert summary, (result.returncode, result.stdout, result.stderr[-2000:])
     return traced, stdout, [int(summary.group(i)) for i in (1, 2, 3)], summary.group(4)
 
 
