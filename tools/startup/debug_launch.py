@@ -244,6 +244,60 @@ def main():
         text = ustr(name) if name else ""
         return (f"[root {root:#x}]" if root else "") + text
 
+    def oa_string(addr):  # the UNICODE_STRING* inside OBJECT_ATTRIBUTES, for rewriting it
+        raw = read(addr, 24)
+        return struct.unpack_from("<Q", raw, 16)[0] if len(raw) >= 24 else 0
+
+    # --map-drive G=C:\folder[;S=D:\folder]: a console executable opens its package at a fixed drive
+    # letter, so a package that sits on another volume never mounts. The file hooks rewrite the path
+    # of an open on a mapped letter to the real folder, in the caller's own UNICODE_STRING.
+    drive_map = {}
+    for item in filter(None, opts.get("--map-drive", "").split(";")):
+        letter, _, folder = item.partition("=")
+        letter = letter.strip().rstrip(":").upper()
+        if len(letter) == 1 and letter.isalpha() and folder.strip():
+            # NT paths take backslashes; the option may arrive with either separator.
+            drive_map[letter] = folder.strip().rstrip("\\/").replace("/", "\\")
+
+    def map_drive(text, string_address):
+        """Rewrites a mapped drive path in place; returns the new text, or None when nothing changed."""
+        if not drive_map or not string_address:
+            return None
+        root = ""
+        body = text
+        if body.startswith("[root ") and "] " in body:
+            split = body.index("] ") + 2
+            root, body = body[:split], body[split:]
+        prefix = ""
+        for candidate in ("\\??\\", "\\\\.\\"):
+            if body.upper().startswith(candidate):
+                prefix, body = body[:len(candidate)], body[len(candidate):]
+                break
+        if len(body) < 2 or body[1] != ":" or body[0].upper() not in drive_map:
+            return None
+        replacement = root + prefix + drive_map[body[0].upper()] + body[2:]
+        raw = read(string_address, 16)
+        if len(raw) < 16:
+            return None
+        _, maximum, buffer = struct.unpack_from("<HH4xQ", raw)
+        encoded = replacement.encode("utf-16-le")
+        if len(encoded) <= maximum:
+            if not write(buffer, encoded):
+                return None
+            write(string_address, struct.pack("<H", len(encoded)))
+            return replacement
+        # The replacement is longer than the caller's buffer, which is the common case: a folder path
+        # against a single letter. Allocate the name in the process and repoint the UNICODE_STRING at
+        # it; the caller may keep the name while its handle is open, so the allocation is left to it.
+        k32.VirtualAllocEx.restype = ctypes.c_void_p
+        k32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+        fresh = k32.VirtualAllocEx(wt.HANDLE(pi.hProcess), None, len(encoded), 0x3000, 0x04)
+        if not fresh or not write(fresh, encoded):
+            return None
+        if not write(string_address, struct.pack("<HH4xQ", len(encoded), len(encoded), fresh)):
+            return None
+        return replacement
+
     trace = opts.get("--trace-files") == "1" or opts.get("--offline", "1") == "1"  # offline mode needs the hooks
     k32.GetModuleHandleW.restype = wt.HMODULE
     ntdll = k32.GetModuleHandleW("ntdll.dll")
@@ -399,10 +453,18 @@ def main():
                 desc = bink_call(name, regs, ret)
             else:
                 if arg.startswith("ustr:"):
-                    target = ustr(regs[arg[5:].capitalize()])
+                    string_address = regs[arg[5:].capitalize()]
+                    target = ustr(string_address)
                 else:
-                    target = oa_name(regs[arg.capitalize()] if arg != 'r8' else regs['R8'])
-                desc = f"{name} {target} from {where(ret)}"
+                    oa_address = regs['R8'] if arg == 'r8' else regs[arg.capitalize()]
+                    target = oa_name(oa_address)
+                    string_address = oa_string(oa_address)
+                mapped = map_drive(target, string_address)
+                desc = f"{name} {mapped or target} from {where(ret)}"
+                if mapped:
+                    desc += " (mapped from " + target + ")"
+                    file_log.write(f"{time.time() - start:7.3f} MAP {target} -> {mapped}\n")
+                    file_log.flush()
                 if offline and any(pattern in target.lower() for pattern in OFFLINE_DENY):
                     # Offline mode: the call never runs. Return STATUS_ACCESS_DENIED to the caller.
                     denied[target] = denied.get(target, 0) + 1
