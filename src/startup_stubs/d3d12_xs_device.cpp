@@ -1419,6 +1419,19 @@ char shown_note[160] = "no frame read back yet";
 void write_file(const wchar_t* path, const void* data, std::size_t bytes);
 void report_present_memory(ID3D12CommandQueue* queue, LONG frame)
 {
+    const bool report = frame == 1 || frame % 300 == 0;
+    static const bool guard = GetEnvironmentVariableW(L"X2W_GPU_BUDGET_EVENT", nullptr, 0) != 0;
+    if (!report && !guard) return;
+    static SRWLOCK guard_lock = SRWLOCK_INIT;
+    if (!TryAcquireSRWLockExclusive(&guard_lock)) return;
+    static ULONGLONG last_sample = 0;
+    static unsigned over_budget = 0;
+    const ULONGLONG now = GetTickCount64();
+    const bool check = guard && now - last_sample >= 1000;
+    if (!report && !check) {
+        ReleaseSRWLockExclusive(&guard_lock);
+        return;
+    }
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12Device> device;
     ComPtr<IDXGIFactory4> factory;
@@ -1440,10 +1453,30 @@ void report_present_memory(ID3D12CommandQueue* queue, LONG frame)
         DXGI_QUERY_VIDEO_MEMORY_INFO info{};
         if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, segment, &info)))
             std::snprintf(value, sizeof(value), "%.1f/%.1f", info.CurrentUsage / 1048576.0, info.Budget / 1048576.0);
+        return info;
     };
-    sample(DXGI_MEMORY_SEGMENT_GROUP_LOCAL, local);
-    sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
-    log("x2w-present-memory frame=%ld process MiB used/budget: local=%s nonlocal=%s", frame, local, nonlocal);
+    const auto usage = sample(DXGI_MEMORY_SEGMENT_GROUP_LOCAL, local);
+    if (report) {
+        sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
+        log("x2w-present-memory frame=%ld process MiB used/budget: local=%s nonlocal=%s", frame, local, nonlocal);
+    }
+    if (check) {
+        last_sample = now;
+        if (!usage.Budget || usage.CurrentUsage <= usage.Budget + usage.Budget / 20) {
+            over_budget = 0;
+        } else if (++over_budget == 3) {
+            wchar_t name[96]{};
+            const DWORD length = GetEnvironmentVariableW(L"X2W_GPU_BUDGET_EVENT", name, ARRAYSIZE(name));
+            if (length && length < ARRAYSIZE(name)) {
+                if (HANDLE request = OpenEventW(EVENT_MODIFY_STATE, FALSE, name)) {
+                    log("x2w-present-memory guard stopping after 3 samples above 105%% of local budget: %s MiB", local);
+                    SetEvent(request);
+                    CloseHandle(request);
+                }
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&guard_lock);
 }
 
 void observe_present_color(LONG frame, ID3D12Resource* surface, const unsigned char* rgba);
@@ -3649,7 +3682,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
     frame_number = frame;
-    if (render_mode() && (frame == 1 || frame % 300 == 0))
+    if (render_mode())
         report_present_memory(static_cast<ID3D12CommandQueue*>(self->own().real), frame);
     draw_dump_flush();
     red_producers().flush();

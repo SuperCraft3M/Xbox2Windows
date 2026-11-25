@@ -42,6 +42,15 @@ DWORD WINAPI output_window_thread(void* ready)
     WNDCLASSW cls{};
     cls.lpfnWndProc = [](HWND window, UINT message, WPARAM w, LPARAM l) -> LRESULT {
         if (message == WM_CLOSE) {
+            wchar_t name[96]{};
+            const DWORD length = GetEnvironmentVariableW(L"X2W_SESSION_CLOSE_EVENT", name, ARRAYSIZE(name));
+            if (length && length < ARRAYSIZE(name)) {
+                if (HANDLE request = OpenEventW(EVENT_MODIFY_STATE, FALSE, name)) {
+                    const BOOL sent = SetEvent(request);
+                    CloseHandle(request);
+                    if (sent) return 0;
+                }
+            }
             ShowWindow(window, SW_MINIMIZE);
             return 0;
         }
