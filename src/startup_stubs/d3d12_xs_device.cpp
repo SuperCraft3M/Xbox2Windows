@@ -1485,7 +1485,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     if (FAILED(readback->Map(0, &range, &mapped))) return;
     AcquireSRWLockExclusive(&shown_lock);
     shown_pixels.resize(shown_width * shown_height);
-    std::uint64_t sum = 0;
+    std::uint64_t red = 0, green = 0, blue = 0;
     for (int y = 0; y < shown_height; ++y) {
         const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset +
                           static_cast<UINT64>(y) * desc.Height / shown_height * footprint.Footprint.RowPitch;
@@ -1493,7 +1493,9 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
             const unsigned char* texel = row + static_cast<UINT64>(x) * desc.Width / shown_width * 4;
             const unsigned r = rgba ? texel[0] : texel[2], g = texel[1], b = rgba ? texel[2] : texel[0];
             shown_pixels[y * shown_width + x] = (r << 16) | (g << 8) | b;
-            sum += r + g + b;
+            red += r;
+            green += g;
+            blue += b;
         }
     }
     ReleaseSRWLockExclusive(&shown_lock);
@@ -1526,9 +1528,15 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const D3D12_RANGE none{0, 0};
     readback->Unmap(0, &none);
     const LONG count = InterlockedIncrement(&shown_frames);
+    const double samples = double(shown_width) * shown_height;
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
-                  desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
-    if (count <= 3 || count % 40 == 0) log("x2w-render presented %s", shown_note);
+                  desc.Width, desc.Height, desc.Format, count, (red + green + blue) / (3.0 * samples));
+    const bool red_dominant = red >= 192 * samples && green <= 32 * samples && blue <= 32 * samples;
+    static LONG was_red_dominant;
+    const bool was_red = InterlockedExchange(&was_red_dominant, red_dominant) != 0;
+    if (count <= 3 || count % 40 == 0 || (red_dominant && !was_red))
+        log("x2w-render presented %s, mean RGB=(%.2f, %.2f, %.2f)/255", shown_note,
+            red / samples, green / samples, blue / samples);
 }
 
 // ---------------------------------------------------------------------------------------------
