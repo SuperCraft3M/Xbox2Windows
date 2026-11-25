@@ -627,6 +627,8 @@ set_tests_properties(startup_chad_check PROPERTIES TIMEOUT 60)
 # BMP writer of the draw dumps (src/startup_stubs/draw_bmp.h); the mutated runs are negative controls.
 add_executable(startup_draw_bmp_check tests/startup_draw_bmp.cpp)
 add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
+add_executable(startup_present_red_blue_pattern tests/startup_present_red_blue_pattern.cpp)
+add_test(NAME startup_present_red_blue_pattern COMMAND startup_present_red_blue_pattern)
 foreach(mutation IN ITEMS tight wrap size-image)
     add_test(NAME startup_draw_bmp_${mutation}_control COMMAND startup_draw_bmp_check --mutate ${mutation})
     set_tests_properties(startup_draw_bmp_${mutation}_control PROPERTIES WILL_FAIL TRUE)

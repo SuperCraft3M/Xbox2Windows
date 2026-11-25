@@ -43,6 +43,7 @@
 #include "packed_target_format.h"
 #include "indexed_texture_descriptor.h"
 #include "present_view_format.h"
+#include "present_red_blue_pattern.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
 #include <d3d12sdklayers.h>
@@ -1486,7 +1487,7 @@ void report_present_memory(ID3D12CommandQueue* queue, LONG frame)
     ReleaseSRWLockExclusive(&guard_lock);
 }
 
-void observe_present_color(LONG frame, ID3D12Resource* surface, const unsigned char* rgba);
+void observe_present_color(LONG frame, ID3D12Resource* surface, const unsigned char* rgba, bool red_blue);
 
 void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG frame)
 {
@@ -1561,6 +1562,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, LON
     AcquireSRWLockExclusive(&shown_lock);
     shown_pixels.resize(shown_width * shown_height);
     std::uint64_t red = 0, green = 0, blue = 0;
+    x2w_startup::PresentRedBluePattern pattern;
     for (int y = 0; y < shown_height; ++y) {
         const auto* row = static_cast<const unsigned char*>(mapped) + footprint.Offset +
                           static_cast<UINT64>(y) * desc.Height / shown_height * footprint.Footprint.RowPitch;
@@ -1571,6 +1573,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, LON
             red += r;
             green += g;
             blue += b;
+            pattern.add(r, g, b);
         }
     }
     ReleaseSRWLockExclusive(&shown_lock);
@@ -1604,7 +1607,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, LON
     if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
         const auto* center = static_cast<const unsigned char*>(mapped) + footprint.Offset +
                              UINT64{desc.Height / 2} * footprint.Footprint.RowPitch + (desc.Width / 2) * 4;
-        observe_present_color(frame, surface, center);
+        observe_present_color(frame, surface, center, pattern.matches());
     }
     readback->Unmap(0, &none);
     const LONG count = InterlockedIncrement(&shown_frames);
@@ -2017,15 +2020,16 @@ void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self
 #include "startup_stubs/red_producer_diagnostic.inl"
 
 void discard_red_producer(ID3D12GraphicsCommandList* list) { red_producers().discard(list); }
-void observe_present_color(LONG frame, ID3D12Resource* surface, const unsigned char* rgba)
+void observe_present_color(LONG frame, ID3D12Resource* surface, const unsigned char* rgba, bool red_blue)
 {
     auto& tracker = red_producers();
     if (!tracker.enabled()) return;
-    const bool matched = tracker.matches(rgba);
-    tracker.observe(frame, frame, surface, matched);
+    const bool pattern = red_blue && tracker.traces_red_blue();
+    const bool matched = tracker.matches(rgba) || pattern;
+    tracker.observe(frame, frame, surface, matched, pattern);
     if (matched || tracker.interested())
-        log("x2w-red sample present=%ld target=%p rgba=%u,%u,%u,%u match=%u",
-            frame, surface, rgba[0], rgba[1], rgba[2], rgba[3], matched);
+        log("x2w-red sample present=%ld target=%p rgba=%u,%u,%u,%u match=%u red_blue=%u",
+            frame, surface, rgba[0], rgba[1], rgba[2], rgba[3], matched, pattern);
 }
 void release_targets(Wrapper* self)
 {

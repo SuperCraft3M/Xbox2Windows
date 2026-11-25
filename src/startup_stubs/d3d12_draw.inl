@@ -1268,6 +1268,12 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                     frame_number + 1, list, tr->key, i, pass.trace_targets[0], status, input_word,
                     desc.ViewDimension, desc.Format, texture, source.Width, source.Height, source.Flags);
             }
+            if (trace_inputs && texture && desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D &&
+                desc.Texture2D.MostDetailedMip == 0 &&
+                std::find(pass.trace_targets, pass.trace_targets + pass.target_count, texture) ==
+                    pass.trace_targets + pass.target_count && texture != pass.trace_depth) {
+                red_producers().capture_input(self, list, texture, tr->key, i, sampled_state(self, texture));
+            }
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
         }

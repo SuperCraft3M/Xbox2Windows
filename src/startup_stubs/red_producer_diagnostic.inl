@@ -18,6 +18,8 @@ class RedProducers {
         bool live = true;
         bool pending = false;
         bool ambiguous = false;
+        bool input = false;
+        D3D12_RESOURCE_STATES restore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     };
     struct History {
         const void* list;
@@ -35,6 +37,7 @@ class RedProducers {
     volatile LONG auto_first_ = 0, auto_last_ = 0;
     unsigned target_rgb_[3]{255, 0, 0};
     bool auto_last_match_ = false;
+    bool auto_red_blue_ = false;
     History history_[history_limit]{};
     std::size_t history_next_ = 0, history_count_ = 0;
     unsigned submit_order_ = 0;
@@ -76,6 +79,7 @@ public:
     }
 
     bool enabled() const { return first_ || auto_count_; }
+    bool traces_red_blue() const { return auto_count_ && target_rgb_[0] == 255 && !target_rgb_[1] && !target_rgb_[2]; }
     bool matches(const unsigned char* rgba) const
     {
         return rgba[0] == target_rgb_[0] && rgba[1] == target_rgb_[1] && rgba[2] == target_rgb_[2];
@@ -98,18 +102,19 @@ public:
                            [target](const Resource& surface) { return surface.Get() == target; });
     }
 
-    void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface, bool matched)
+    void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface, bool matched, bool pattern)
     {
         if (!auto_count_ || auto_last_) return;
         std::lock_guard<std::mutex> guard(lock_);
         const bool became_matched = matched && !auto_last_match_;
         auto_last_match_ = matched;
         if (auto_last_ || !became_matched || sampled_frame < auto_min_ || published_frame > LONG_MAX - auto_count_) return;
+        auto_red_blue_ = pattern;
         InterlockedExchange(&auto_first_, published_frame + 1);
         InterlockedExchange(&auto_last_, published_frame + auto_count_);
-        log("x2w-red auto armed sampled_present=%lld published_at=%ld target=%p capture=%ld..%ld rgb=%u,%u,%u",
+        log("x2w-red auto armed sampled_present=%lld published_at=%ld target=%p capture=%ld..%ld rgb=%u,%u,%u red_blue=%u",
             sampled_frame, published_frame, surface, static_cast<LONG>(auto_first_), static_cast<LONG>(auto_last_),
-            target_rgb_[0], target_rgb_[1], target_rgb_[2]);
+            target_rgb_[0], target_rgb_[1], target_rgb_[2], pattern);
         for (std::size_t i = 0; i < history_count_; ++i) {
             const auto& e = history_[(history_next_ + history_limit - history_count_ + i) % history_limit];
             log("x2w-red history record=%ld list=%p target=%p op=%s key=%016llx rt=%u",
@@ -142,6 +147,28 @@ public:
             if (history_count_ < history_limit) ++history_count_;
         }
         if (!interested()) return 0;
+        return capture(owner, list, surface, operation, key, attachment, false, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+
+    void capture_input(Wrapper* owner, ID3D12GraphicsCommandList* list, ID3D12Resource* source,
+                       u64 key, unsigned srv, D3D12_RESOURCE_STATES restore)
+    {
+        if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+        std::lock_guard guard(lock_);
+        if (!auto_red_blue_ || inputs_ >= 16) return;
+        if (const unsigned mark = capture(owner, list, source, "input", key, srv, true, restore)) {
+            ++inputs_;
+            copy_pixel(owner, entries_[mark - 1], after_offset);
+        }
+    }
+
+private:
+    unsigned inputs_ = 0;
+
+    // lock_ is held. A readback is owned by the recording and reused by its two samples.
+    unsigned capture(Wrapper* owner, ID3D12GraphicsCommandList* list, ID3D12Resource* surface,
+                     const char* operation, u64 key, unsigned slot, bool input, D3D12_RESOURCE_STATES restore)
+    {
         if (entries_.size() >= 512) {
             if (!full_logged_) log("x2w-red producer capture limit reached at frame %ld", frame_number + 1);
             full_logged_ = true;
@@ -157,7 +184,9 @@ public:
         buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
         buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         const auto ordinal = static_cast<unsigned>(entries_.size() + 1);
-        Entry entry{list, {}, *found, {}, nullptr, frame_number + 1, 0, attachment, ordinal, 0, operation, key};
+        Entry entry{list, {}, Resource(surface), {}, nullptr, frame_number + 1, 0, slot, ordinal, 0, operation, key};
+        entry.input = input;
+        entry.restore = restore;
         const HRESULT hr = device_of(the_device)->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&entry.readback));
         if (FAILED(hr)) {
@@ -169,6 +198,7 @@ public:
         return ordinal;
     }
 
+public:
     void after(Wrapper* owner, unsigned ordinal)
     {
         if (!ordinal) return;
@@ -185,12 +215,13 @@ private:
         to.PlacedFootprint.Offset = offset;
         to.PlacedFootprint.Footprint = {desc.Format, 1, 1, 1, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
         const D3D12_TEXTURE_COPY_LOCATION from{surface, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-        const UINT x = static_cast<UINT>(desc.Width / 2);
-        const UINT y = desc.Height / 2;
+        const unsigned divisor = entry.input && offset ? 4 : 2;
+        const UINT x = static_cast<UINT>(desc.Width / divisor);
+        const UINT y = desc.Height / divisor;
         const D3D12_BOX pixel{x, y, 0, x + 1, y + 1, 1};
         require_state(owner, surface, D3D12_RESOURCE_STATE_COPY_SOURCE);
         entry.list->CopyTextureRegion(&to, 0, 0, 0, &from, &pixel);
-        require_state(owner, surface, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        require_state(owner, surface, entry.restore);
     }
 
 public:
@@ -255,6 +286,13 @@ private:
             std::memcpy(prior, memory, sizeof(prior));
             std::memcpy(rgba, static_cast<unsigned char*>(memory) + after_offset, sizeof(rgba));
             entry.readback->Unmap(0, &none);
+            if (entry.input) {
+                log("x2w-red input pixels record=%ld submit=%ld list=%p key=%016llx srv=%u texture=%p "
+                    "center=%u,%u,%u,%u quarter=%u,%u,%u,%u",
+                    entry.record_frame, entry.submit_frame, entry.list, entry.key, entry.attachment,
+                    entry.surface.Get(), prior[0], prior[1], prior[2], prior[3], rgba[0], rgba[1], rgba[2], rgba[3]);
+                continue;
+            }
             log("x2w-red producer order=%u ordinal=%u record=%ld submit=%ld queue=%p target=%p op=%s key=%016llx rt=%u rgba=%u,%u,%u,%u before=%u,%u,%u,%u",
                 entry.submit_order, entry.ordinal, entry.record_frame, entry.submit_frame, entry.queue, entry.surface.Get(),
                 entry.operation, entry.key, entry.attachment, rgba[0], rgba[1], rgba[2], rgba[3],
