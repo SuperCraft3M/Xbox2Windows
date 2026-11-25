@@ -956,6 +956,35 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                    srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
                                    srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
+            static const bool resolve_indices = x2w_local::env_on("X2W_INDEXED_TEXTURE_DESCRIPTORS");
+            if (resolve_indices && entry_ok && pass.source_view_heap && words[0] != view_token_magic) {
+                x2w_startup::TextureDescriptorWords initial{};
+                std::copy(std::begin(words), std::end(words), initial.begin());
+                AcquireSRWLockShared(&note_lock);
+                for (const auto& heap : heap_infos()) {
+                    if (heap.wrapper != pass.source_view_heap || !heap.title_cpu ||
+                        heap.increment != sizeof(initial)) continue;
+                    const auto resolved = x2w_startup::indexed_texture_descriptor(
+                        initial, heap.logical_count, view_token_magic,
+                        [&heap](std::uint32_t index, auto& descriptor) {
+                            const auto* address = reinterpret_cast<const void*>(
+                                heap.title_cpu + u64{index} * heap.increment);
+                            if (!x2w_local::readable(address, sizeof(descriptor))) return false;
+                            std::memcpy(descriptor.data(), address, sizeof(descriptor));
+                            return true;
+                        });
+                    if (resolved && (*resolved)[1] < view_records().size() &&
+                        view_records()[(*resolved)[1]].slot == 18) {
+                        std::copy(resolved->begin(), resolved->end(), std::begin(words));
+                        static LONG reported;
+                        if (first_calls(reported, 48))
+                            log("x2w-draw indexed texture key=%016llx srv=%u index=%u view=%u",
+                                tr->key, i, initial[0], words[1]);
+                    }
+                    break;
+                }
+                ReleaseSRWLockShared(&note_lock);
+            }
             // A texture: the title's descriptor memory carries the id of the view it created there.
             ViewRecord record{};
             bool known = false;

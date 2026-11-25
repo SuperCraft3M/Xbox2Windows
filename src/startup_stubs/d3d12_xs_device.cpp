@@ -37,6 +37,7 @@
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
+#include "indexed_texture_descriptor.h"
 #include "present_view_format.h"
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
