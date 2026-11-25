@@ -15,7 +15,9 @@ bool same_texture_description(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE
 
 bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
 {
-    return (r.Format == DXGI_FORMAT_BC3_UNORM || r.Format == DXGI_FORMAT_BC7_UNORM) &&
+    return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.DepthOrArraySize == 1 &&
+           r.MipLevels == 1 && r.SampleDesc.Count == 1 && r.SampleDesc.Quality == 0 &&
+           (r.Format == DXGI_FORMAT_BC3_UNORM || r.Format == DXGI_FORMAT_BC7_UNORM) &&
            static_cast<UINT>(r.Layout) == 0x105 && r.Alignment == 0 &&
            (r.Flags == D3D12_RESOURCE_FLAG_NONE || static_cast<UINT>(r.Flags) == 0x300000) &&
            r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
@@ -63,8 +65,7 @@ bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
 {
     if (supports_placed_memory_srv(r, v)) return true;
-    return r.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && x2w_startup::console_address_texture(r) &&
-           x2w_startup::address_view_fits(r, v);
+    return console_layout_srv(r) && x2w_startup::address_view_fits(r, v);
 }
 
 bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
@@ -96,6 +97,27 @@ bool supports_placed_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER
            v.Texture2D.ResourceMinLODClamp == 0.0f;
 }
 
+// The layout tables describe the bytes independently of the desktop adapter's format support.
+bool desktop_address_view_supported(Wrapper* device, const D3D12_RESOURCE_DESC& r,
+                                    const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
+{
+    auto* const desktop = device_of(device);
+    D3D12_FEATURE_DATA_FORMAT_INFO planes{r.Format};
+    if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &planes, sizeof(planes))) || planes.PlaneCount != 1)
+        return false;
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT view{v.Format};
+    if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &view, sizeof(view))) ||
+        !(view.Support1 & (D3D12_FORMAT_SUPPORT1_SHADER_LOAD | D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)))
+        return false;
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT storage{r.Format};
+    if (r.Format == v.Format) storage = view;
+    else if (FAILED(desktop->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &storage, sizeof(storage)))) return false;
+    return (storage.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) &&
+           (r.MipLevels == 1 || (storage.Support1 & D3D12_FORMAT_SUPPORT1_MIP));
+}
+
 bool memory_srv_destination(u64 handle)
 {
     bool valid = false;
@@ -119,6 +141,7 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     AcquireSRWLockShared(&note_lock);
     for (const auto& [wrapper, info] : resource_infos()) {
         if (reinterpret_cast<u64>(wrapper->own().title_memory) != address ||
+            wrapper->own().tiled_address_srv ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0 ||
             !same_texture_description(desc, info.console)) continue;
         if (match) {
@@ -129,6 +152,26 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     }
     ReleaseSRWLockShared(&note_lock);
     return match;
+}
+
+// An unmatched or interior view must not reinterpret bytes owned by a live resource.
+bool address_resource_overlap(u64 address, u64 span)
+{
+    bool found = false;
+    AcquireSRWLockShared(&note_lock);
+    for (const auto& [wrapper, info] : resource_infos()) {
+        if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
+            continue;
+        const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
+        const u64 bytes = info.bytes ? info.bytes
+            : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
+        if (base && (address <= base ? base - address < span : address - base < bytes)) {
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return found;
 }
 
 // A live render-target, depth or UAV resource overlapping the texel is written on the desktop side, so its
@@ -395,15 +438,20 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         : (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
     if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
-    // Without a resource the title created at this address with this description, a texture in a console
-    // layout is read from the address. A match that is itself a texture published here is published
-    // again, which announces a write, so changed texels are uploaded again.
-    const bool console = console_layout_srv(*resource);
+    // A new console-layout view reads the address only when there is no matching live resource.
     const char* outcome = tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource) ? "published BC shape" : "existing resource";
-    if (console && (!texture || texture->own().tiled_address_srv)) {
-        held = console_address_hold(self, input->address, *resource);
-        texture = held ? nullptr : publish_tiled_texture(self, input->address, *resource);
-        outcome = "published console layout";
+    if (console_layout_srv(*resource)) {
+        if ((!texture || !supports_placed_memory_srv(*resource, input->view)) &&
+            !desktop_address_view_supported(self, *resource, input->view)) {
+            held = "unsupported_desktop_format";
+            texture = nullptr;
+        } else if (!texture) {
+            held = console_address_hold(self, input->address, *resource);
+            if (!held && address_resource_overlap(input->address, address_texture_bytes(*resource)))
+                held = "overlapping_resource";
+            texture = held ? nullptr : publish_tiled_texture(self, input->address, *resource);
+            outcome = "published console layout";
+        }
     }
     if (!texture) outcome = held ? held : "texture_unavailable (no resource there, or texels not readable or over 64 MiB)";
     log_address_kind(outcome, *resource, input->view, input->address);

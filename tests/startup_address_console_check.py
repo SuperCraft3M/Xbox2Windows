@@ -15,6 +15,7 @@ under src/amd/addrlib at the revision tools/fetch_addrlib.py pins (Mesa 25.1.0, 
 and src/core/addrlib2.cpp, each with the notice "Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All
 rights reserved. SPDX-License-Identifier: MIT". No addrlib code is included.
 """
+import os
 from pathlib import Path
 import struct
 import sys
@@ -218,7 +219,8 @@ def gate_colour(payload):
 def check_gate(directory, consumer, backend, ring):
     """Uploads recorded while the queue cannot run must still hold their bytes when it does.
 
-    The fixture makes the queue wait on a fence it controls, then records and submits eighteen lists. Each
+    The normal fixture records and discards a draw using payload 0 before the first submit retries that
+    payload. The fixture makes the queue wait on a fence it controls, then records and submits eighteen lists. Each
     republishes one 2048x2048 RGBA8 texture (64 KiB standard layout, 16 MiB) from the same address with a new
     payload and draws it: payload 0 over the left half of the target, the others over the right half. The list
     object and its allocator are reset between submits. Nothing may complete while the fence is unsignalled.
@@ -236,6 +238,9 @@ def check_gate(directory, consumer, backend, ring):
     modes = {"X2W_TEST_CONSOLE_GATE": "1", "X2W_TRAP_LOG": str(trap_log)}
     if ring:
         modes["X2W_TEST_ADDRESS_UPLOAD_RING"] = "1"
+    else:
+        # The Windows switch checks for presence, including an empty value.
+        os.environ.pop("X2W_TEST_ADDRESS_UPLOAD_RING", None)
     actual = draw_texture(directory, consumer, backend, hlsl, modes)
     if actual is None:
         return 77

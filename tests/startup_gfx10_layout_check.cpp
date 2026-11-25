@@ -252,31 +252,49 @@ void check_address_textures()
     expect("BC1 height not whole blocks", texture(128, 126, 1, 1, DXGI_FORMAT_BC1_UNORM, 0x10a), false);
     expect("RGBA8 odd sides", texture(257, 129, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0x106), true);
 
-    const D3D12_RESOURCE_DESC chain = texture(512, 512, 10, 4, DXGI_FORMAT_BC7_UNORM, 0x109);
+    expect("combined depth and stencil", texture(64, 64, 1, 1, DXGI_FORMAT_R24G8_TYPELESS, 0x105), false);
+    expect("typed depth", texture(64, 64, 1, 1, DXGI_FORMAT_D32_FLOAT, 0x105), false);
+    expect("mip count exceeds dimensions", texture(4, 4, 4, 1, DXGI_FORMAT_BC7_UNORM, 0x109), false);
+    expect("too many array slices", texture(16, 16, 1, 2049, DXGI_FORMAT_R8_UNORM, 0x105), false);
+
+    D3D12_RESOURCE_DESC chain = texture(512, 512, 10, 1, DXGI_FORMAT_BC7_UNORM, 0x109);
     D3D12_SHADER_RESOURCE_VIEW_DESC v{};
     v.Format = DXGI_FORMAT_BC7_UNORM;
     v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     v.Texture2D.MipLevels = 10;
     const auto fits = [&](const char* name, bool want) {
         if (x2w_startup::address_view_fits(chain, v) != want) fail(std::string("address view: ") + name);
     };
     fits("whole chain", true);
     v.Texture2D.MipLevels = ~0u; fits("all mips", true);
-    v.Format = DXGI_FORMAT_BC7_UNORM_SRGB; fits("sRGB view of the same family", true);
+    v.Format = DXGI_FORMAT_BC7_UNORM_SRGB; fits("sRGB view of typed UNORM storage", false);
+    chain.Format = DXGI_FORMAT_BC7_TYPELESS; fits("sRGB view of typeless storage", true);
+    v.Format = DXGI_FORMAT_BC7_TYPELESS; fits("typeless view", false);
     v.Format = DXGI_FORMAT_BC3_UNORM; fits("another family", false);
-    v.Format = DXGI_FORMAT_BC7_UNORM;
+    chain.Format = v.Format = DXGI_FORMAT_BC7_UNORM;
+    v.Shader4ComponentMapping = 0; fits("missing mapping validity bit", false);
+    v.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 1, 2, 7);
+    fits("reserved component mapping", false);
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     v.Texture2D.MipLevels = 11; fits("too many mips", false);
     v.Texture2D.MipLevels = 0; fits("no mips", false);
     v.Texture2D.MipLevels = 1; v.Texture2D.MostDetailedMip = 10; fits("first mip past the chain", false);
     v.Texture2D.MostDetailedMip = 9; fits("last mip", true);
     v.Texture2D.PlaneSlice = 1; fits("second plane", false);
+    v.Texture2D.PlaneSlice = 0;
+    v.Texture2D.ResourceMinLODClamp = 2.0f; fits("explicit LOD clamp", false);
+    v.Texture2D.ResourceMinLODClamp = 0.0f;
+    chain.DepthOrArraySize = 4; fits("non-array view of an array", false);
     v = {};
     v.Format = DXGI_FORMAT_BC7_UNORM;
     v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     v.Texture2DArray.MipLevels = 10;
     v.Texture2DArray.ArraySize = 4; fits("whole array", true);
-    v.Texture2DArray.FirstArraySlice = 1; fits("array past the last slice", false);
-    v.Texture2DArray.ArraySize = 3; fits("last three slices", true);
+    v.Texture2DArray.FirstArraySlice = 2; fits("array extends past the last slice", false);
+    v.Texture2DArray.ArraySize = 2; fits("last two slices", true);
+    v.Texture2DArray.ArraySize = ~0u; fits("unspecified array size", false);
     v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE; fits("cube view", false);
 }
 } // namespace
@@ -299,6 +317,6 @@ int main(int argc, char** argv)
         std::printf("startup_gfx10_layout: %d FAILED\n", failures);
         return 1;
     }
-    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 9 round trips, 11 refusals, 12 address descriptions, 16 views)\n");
+    std::printf("startup_gfx10_layout: PASS (30 equations, 5 4 KiB surfaces, 8 64 KiB chains, 10 tile plans, 9 round trips, 11 refusals, 19 address descriptions, 21 views)\n");
     return 0;
 }

@@ -11557,8 +11557,8 @@ The accepted descriptions, views, limits and log lines are listed in `docs/start
 one-pipe equations of AMD addrlib's `GFX10_SW_{256,4K,64K}_{S,D}_PATINFO` rows written out in the test
 (five element sizes for each of the six modes), with `bc7_4k_s.h` on five 4 KiB surfaces, with
 `bc64_chain.h` on eight 64 KiB chains and with `tile64_plan.h` on ten tile plans; it tiles and
-detiles nine textures back to their bytes, and lists 11 refused layouts, 15 slot 70 descriptions and
-16 views on each side of the accepted set. `startup_gfx10_layout_display_control` reads the `0x10a`
+detiles nine textures back to their bytes, and lists 11 refused layouts, 19 slot 70 descriptions and
+21 views on each side of the accepted set. `startup_gfx10_layout_display_control` reads the `0x10a`
 order as `0x109` and must fail. The addrlib reference is the revision `tools/fetch_addrlib.py` pins
 (Mesa 25.1.0, commit `5c142e46f3f6e752ed745fd48912ebb8fad67145`, `src/amd/addrlib`, MIT); the files
 and their notice ("Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.",
@@ -11581,7 +11581,7 @@ a partial-tile BC view does after a later row copy.
 An upload of a console-layout texture owns its upload buffer. The buffer and the texture stay referenced
 by the recording and by each submit of it until the queue has completed that submit; the shared
 upload ring, which is reused without waiting for a queue, is not used. `startup_address_console_gate_{warp,hardware}`
-makes the queue wait on a fence the fixture holds (queue slot 17), then records and submits eighteen
+starts by closing and resetting an unsubmitted recording of payload 0, then records the identical bytes again. It makes the queue wait on a fence the fixture holds (queue slot 17), then records and submits eighteen
 lists on one list object, resetting the allocator and the list between them. Each republishes one
 2048 by 2048 RGBA8 texture at `0x109` (16 MiB) from the same address with a new payload and draws it,
 payload 0 over the left half of the target and the others over the right half. No submit may complete

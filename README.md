@@ -107,6 +107,7 @@ After the full [Windows build](#first-build), run one comparison from the reposi
 | PE 32/64-bit base fixups against Windows | `ctest --preset dev --no-tests=error -R '^cpu_native_highlow$' -V` · [scope and controls](docs/experiments.md#highlow-and-mixed-width-base-relocations) |
 | [CPU counted cache-line zero loops](docs/experiments.md#counted-cache-line-zero-loops) | `ctest --preset release --no-tests=error -R '^cpu_counted_clzero$' -V` |
 | [Experimental startup stand-ins and debugger (trap-by-default DLLs)](docs/startup-runtime.md) | `ctest --preset release --no-tests=error -R '^startup_stubs$' -V` |
+| [Sample a texture by address in a translated draw](docs/startup-runtime.md#textures-published-by-address-device-slot-70) | `ctest --preset release --no-tests=error -R '^startup_address_console_' -V` |
 | [Desktop audio render sink and its three-case fixture (WASAPI)](docs/experiments.md#desktop-audio-render-sink) | `ctest --preset release --no-tests=error -R '^startup_audio_output$' -V` |
 
 The control-flow CPU translator supports [source-built string memory transfers](docs/experiments.md#string-memory-transfers-in-the-control-flow-cpu-lifter). MOVS and STOS, with and without REP, copy and fill 1-, 2-, 4- and 8-byte elements in either direction.

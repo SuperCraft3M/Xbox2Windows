@@ -336,7 +336,6 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         constexpr unsigned payloads = 18;
         void* gate = nullptr;
         if (FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&gate))))) return 44;
-        if (FAILED(static_cast<HRESULT>(invoke(queue, 17, arg(gate), 1)))) return 45;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
         const auto next_recording = [&] {
             if (FAILED(static_cast<HRESULT>(invoke(frame.allocator, 8))) ||
@@ -346,6 +345,13 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
             invoke(list, 25, arg(pso));
             return true;
         };
+        // Retrying the same bytes after abandoning a recording still needs an upload. Keep the
+        // shared-ring control's first upload submitted so its mismatch comes from ring wrap.
+        if (!GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING", nullptr, 0)) {
+            if (const int result = draw_gated_console_payload(guest, list, 0, true)) return result;
+            if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || !next_recording()) return 35;
+        }
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 17, arg(gate), 1)))) return 45;
         for (unsigned payload = 0; payload < payloads; ++payload) {
             if (payload && !next_recording()) return 35;
             if (const int result = draw_gated_console_payload(guest, list, payload, payload == 0)) return result;
