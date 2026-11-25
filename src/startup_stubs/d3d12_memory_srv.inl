@@ -76,6 +76,7 @@ bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOUR
                v.Texture2D.MipLevels <= r.MipLevels - v.Texture2D.MostDetailedMip &&
                !v.Texture2D.PlaneSlice && v.Texture2D.ResourceMinLODClamp == 0;
     }
+    if (x2w_startup::supports_single_element_srv(r, v)) return true;
     return r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && r.Width && r.Height &&
            r.DepthOrArraySize == 1 && r.MipLevels == 1 && r.SampleDesc.Count == 1 && r.SampleDesc.Quality == 0 &&
            (r.Format == DXGI_FORMAT_R8_UNORM || tiled_bc_srv(r)) && v.Format == r.Format && !(r.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
@@ -118,6 +119,28 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
     }
     ReleaseSRWLockShared(&note_lock);
     return match;
+}
+
+// A live render-target, depth or UAV resource overlapping the texel is written on the desktop side, so its
+// title memory does not hold the texel. For a resource of unknown size, its base is the only known byte.
+bool gpu_written_overlap(u64 address, UINT texel_bytes)
+{
+    constexpr UINT gpu_written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    bool found = false;
+    AcquireSRWLockShared(&note_lock);
+    for (const auto& [wrapper, info] : resource_infos()) {
+        const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
+        const u64 bytes = info.bytes ? info.bytes : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
+        const bool overlap = address <= base ? base - address < texel_bytes : address - base < bytes;
+        if (base && overlap &&
+            (static_cast<UINT>(info.console.Flags) & gpu_written) && InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0) {
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return found;
 }
 
 Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
@@ -184,7 +207,8 @@ bool latest_texture_write_is_rows(u64 address)
 
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
-    const auto bytes = x2w_startup::bc64::supports(desc) ? x2w_startup::bc64::Chain(desc).bytes() : x2w_startup::Bc16Surface(desc).size();
+    const UINT element = x2w_startup::single_element_bytes(desc);
+    const auto bytes = element ? u64{element} : x2w_startup::bc64::supports(desc) ? x2w_startup::bc64::Chain(desc).bytes() : x2w_startup::Bc16Surface(desc).size();
     // The transient upload ring accepts individual copies up to 64 MiB.
     if (bytes > (64ull << 20) || !x2w_local::readable(reinterpret_cast<const void*>(address), bytes)) return nullptr;
     std::lock_guard lock(tiled_srv_mutex);
@@ -264,6 +288,17 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
     static LONG refused;
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         if (first_calls(refused, 8)) log_refused_memory_srv("unsupported memory SRV arguments", reason, resource, input, destination);
+        return;
+    }
+    // A single-element texture is published by address like a tiled view: its texel is read at offset 0.
+    if (x2w_startup::supports_single_element_srv(*resource, input->view)) {
+        if (gpu_written_overlap(input->address, x2w_startup::single_element_bytes(*resource))) {
+            if (first_calls(refused, 8))
+                log_refused_memory_srv("GPU-written resource at the supplied address", "gpu_written_resource", resource, input, destination);
+        } else if (Wrapper* texture = publish_tiled_texture(self, input->address, *resource))
+            view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);
+        else if (first_calls(refused, 8))
+            log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
         return;
     }
     if (resource->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {

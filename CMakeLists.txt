@@ -1788,6 +1788,14 @@ target_include_directories(startup_bc64_supports_check PRIVATE src)
 add_test(NAME startup_bc64_supports COMMAND startup_bc64_supports_check)
 add_test(NAME startup_bc64_supports_layout_control COMMAND startup_bc64_supports_check --mutate layout)
 set_tests_properties(startup_bc64_supports_layout_control PROPERTIES WILL_FAIL TRUE)
+# Which descriptions take the single-element memory SRV path (src/startup_stubs/single_element_srv.h), without
+# a device. The mutated run expects an XOR layout to be accepted and is the negative control.
+add_executable(startup_single_element_srv_check tests/startup_single_element_srv_check.cpp)
+target_compile_features(startup_single_element_srv_check PRIVATE cxx_std_17)
+target_include_directories(startup_single_element_srv_check PRIVATE src)
+add_test(NAME startup_single_element_srv COMMAND startup_single_element_srv_check)
+add_test(NAME startup_single_element_srv_xor_control COMMAND startup_single_element_srv_check --mutate xor)
+set_tests_properties(startup_single_element_srv_xor_control PROPERTIES WILL_FAIL TRUE)
 # Slot-10 tile plan for layout 0x10a (src/startup_stubs/tile64_plan.h) without a device: tile shapes,
 # accepted descriptions and hand-worked plans. The mutated runs are negative controls.
 add_executable(startup_tile64_plan_check tests/startup_tile64_plan_check.cpp)
@@ -2359,6 +2367,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_address_single_element_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_single_element_srv_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_address_single_element_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_address_buffer_srv_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_buffer_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")

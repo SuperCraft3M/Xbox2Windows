@@ -11550,6 +11550,32 @@ The fixture checks the XG layout, tile spans, block offsets, copy in and out, an
 ctest --preset release --no-tests=error --output-on-failure -R '^startup_xg_bc_chain_'
 ```
 
+### Single-element 2D and 3D textures published by address
+
+Device slot 70 publishes a 1×1 2D or 1×1×1 3D texture by address, without a resource object. It must have one mip, one sample, default or 64 KiB alignment, and a plain colour format whose element is one texel of 1 to 16 bytes. R8_UNORM keeps its placed-texture path. The view must name the whole texture with the default mapping. The only element is read from offset 0 of the guest memory. That holds for layout UNKNOWN, the value seen on such views, and for linear (`0x100`). For the swizzle modes AMD addrlib defines without pipe/bank XOR (`0x101`, `0x102`, `0x105`, `0x106`, `0x109`, `0x10A`) it is inferred from the source, not run: a swizzle address is a block offset plus a bit pattern of the coordinates, both zero at the origin, and a single mip sits at offset 0 (`Gfx10Lib::ComputeSurfaceInfoMacroTiled` at the pinned [revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib)). Reserved modes (`0x103`, `0x104`, `0x107`, `0x108`, `0x10B`) and XOR modes (`0x110` and up) stay refused. So do larger shapes, mip chains, arrays, multisampling, other alignments, block-compressed formats and render-target, depth or UAV flags. A view over a live render-target, depth or UAV resource that covers the address (its base, or inside its known allocation size) is refused with `reason=gpu_written_resource`, because that resource is written on the desktop side. The translated draw uploads the texel through the footprint path and rehashes it on every bind, so a write between two draws is seen.
+
+Limits: the GPU-written check runs when the view is published, so it does not see a resource created later. The check compares the entire texel with the live resource range (only its base byte if the allocation size is unknown). Published address-only views are never evicted (as for the BC views above).
+
+`startup_single_element_srv` checks 50 descriptions without a device; its `xor_control` expects layout `0x115` to be accepted and must fail. `startup_address_single_element_{warp,hardware}` draws eight columns per dimension from a translated shader that loads texel zero. The columns are:
+
+- RGBA8 at layouts 0 and `0x105`;
+- the first texel rewritten and published again;
+- the texel rewritten without a new publication, in the same frame;
+- B8G8R8A8 and R16G16B16A16_FLOAT;
+- 64 KiB alignment.
+
+Before the fourth column, fifteen refused calls name memory holding another texel; the previous view must stay. On Windows 11 build 26300 with the debug layer off, RTX 5090 (32.0.16.2135) and WARP (10.0.26100.10068) matched all 32 RGBA pixels per dimension. Each of these changes fails the WARP draw:
+
+- reverting the runtime change, which makes column 0 read zero;
+- accepting 2x1, two mips or layout `0x115` (column 3 reads the other texel);
+- dropping the per-bind rehash (column 3 reads the previous texel);
+- checking only the base of a GPU-written resource (column 3 reads the other texel).
+
+```powershell
+cmake --build --preset release --target startup_stream_consumer startup_single_element_srv_check d3d12_xs_shim
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_(single_element_srv|address_single_element_)'
+```
+
 ### Placed vertex buffers consumed by a translated draw
 
 `startup_placed_vertex_{hardware,warp}` opens two real slot-133 buffers on CPU-visible allocations with bases separated by 1 TiB. Slot 48 supplies the full guest address and byte length to a translated vertex-stream binding. The shader can read from the registered GPU buffer directly when the resource aliases the guest memory, the length covers whole DWORDs and the start is aligned to 16 bytes. Views crossing a registered boundary or overlapping multiple live placements on the list's device produce a null descriptor before staging. Final wrapper release removes the placement from binding lookup.

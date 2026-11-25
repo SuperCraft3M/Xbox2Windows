@@ -198,6 +198,7 @@ def check_every_slot70_reason_is_reported(failures: list[str]) -> None:
         ("unsupported memory SRV arguments", "null_address"),
         ("unsupported memory SRV arguments", "unsupported_description"),
         ("unsupported memory SRV arguments", "destination_outside_view_heaps"),
+        ("GPU-written resource at the supplied address", "gpu_written_resource"),
         ("unavailable buffer at the supplied address", "buffer_unavailable"),
         ("unavailable texture at the supplied base and layout", "texture_unavailable"),
     ]
