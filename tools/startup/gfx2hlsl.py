@@ -733,6 +733,26 @@ class Stage:
             self.set_s(d + 1, self.S(r[2]) if r and r[1] != r[2] else '0u')
         return None
 
+    def op_s_mulk_i32(self, ops, mods):
+        if mods or len(ops) != 2:
+            raise Unsupported('s_mulk_i32 operands or modifiers')
+        dst = reg_range(ops[0])
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('s_mulk_i32 destination %s' % ops[0])
+        if not re.fullmatch(r'0x[0-9a-f]{1,4}', ops[1]):
+            raise Unsupported('s_mulk_i32 immediate %s' % ops[1])
+        register = dst[1]
+        symbol = self.sym.get(register)
+        if register in self.masks or (symbol and symbol[0] not in ('const', 'ud')):
+            raise Unsupported('s_mulk_i32 requires a plain scalar word')
+        raw = int(ops[1], 16)
+        imm = raw - 0x10000 if raw & 0x8000 else raw
+        if symbol and symbol[0] == 'const':
+            value = (symbol[1] * imm) & 0xffffffff
+            self.set_s(register, '0x%08xu' % value, ('const', value))
+        else:
+            self.set_s(register, '%s * 0x%08xu' % (self.S(register), imm & 0xffffffff))
+
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
         dst = reg_range(ops[0])
         if not dst or dst[0] != 's':
@@ -1609,7 +1629,8 @@ VEC_U_TO_F = {
 # operands are uints; the result is a uint expression
 VEC_U = {
     'v_add_nc_u32': (2, '{0} + {1}'), 'v_sub_nc_u32': (2, '{0} - {1}'), 'v_subrev_nc_u32': (2, '{1} - {0}'),
-    'v_mul_lo_u32': (2, '{0} * {1}'), 'v_and_b32': (2, '{0} & {1}'), 'v_or_b32': (2, '{0} | {1}'), 'v_xor_b32': (2, '{0} ^ {1}'),
+    'v_mul_lo_u32': (2, '{0} * {1}'), 'v_mul_hi_u32': (2, 'mul_hi_u32({0}, {1})'),
+    'v_and_b32': (2, '{0} & {1}'), 'v_or_b32': (2, '{0} | {1}'), 'v_xor_b32': (2, '{0} ^ {1}'),
     'v_not_b32': (1, '~{0}'), 'v_lshlrev_b32': (2, '{1} << ({0} & 31)'), 'v_lshrrev_b32': (2, '{1} >> ({0} & 31)'),
     'v_ashrrev_i32': (2, 'uint(int({1}) >> ({0} & 31))'), 'v_min_u32': (2, 'min({0}, {1})'), 'v_max_u32': (2, 'max({0}, {1})'),
     'v_min_i32': (2, 'uint(min(int({0}), int({1})))'), 'v_max_i32': (2, 'uint(max(int({0}), int({1})))'),
@@ -1785,6 +1806,9 @@ class Pipeline:
                '    return ftz32(sum);',
                '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
+               'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
+               ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
+               ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'
