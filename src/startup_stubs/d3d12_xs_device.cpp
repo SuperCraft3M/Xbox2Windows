@@ -44,6 +44,8 @@
 #include <d3d12shader.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
+#include <wrl/client.h>
+#include "startup_stubs/list_upload_pages.h"
 
 #include <algorithm>
 #include <array>
@@ -101,6 +103,7 @@ struct alignas(16) WrapperOwn {
     // Updated when the fence is signaled; GPU work counts as complete at once while lists are no-ops.
     volatile LONG64 completed;
     bool list_open;   // CommandList (render mode): recording between reset and close
+    x2w_upload::Arena* list_uploads; // Current recording's allocations, owned by its desktop allocator.
     bool list_close_failed; // Desktop Reset repeats a failed Close result indefinitely.
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
@@ -1092,6 +1095,7 @@ struct DesktopAllocator {
     // until it is idle and Reset(); hardware drivers can fault if a second recording starts on
     // an allocator whose failed recording is still attached.
     bool close_failed;
+    std::vector<std::unique_ptr<x2w_upload::Arena>> uploads;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1124,6 +1128,48 @@ bool allocator_idle(const DesktopAllocator* allocator)
     return true;
 }
 
+// List slot 148 (Xbox order), allocate CPU-writable upload memory for this recording.
+void* __stdcall list_allocate_upload(Wrapper* self, UINT64 bytes, UINT64 alignment)
+{
+    if (!bytes || !alignment || (alignment & (alignment - 1)) ||
+        bytes > UINT64_MAX - (std::max)(alignment, UINT64{16})) return nullptr;
+    x2w_upload::Allocation allocation{};
+    AcquireSRWLockExclusive(&allocator_lock);
+    auto& state = self->own();
+    const auto found = list_recordings.find(self);
+    if (state.list_open && state.list_device && found != list_recordings.end() && found->second) {
+        try {
+            if (!state.list_uploads) {
+                auto arena = std::make_unique<x2w_upload::Arena>();
+                found->second->uploads.push_back(std::move(arena));
+                state.list_uploads = found->second->uploads.back().get();
+            }
+            allocation = state.list_uploads->allocate(device_of(state.list_device), bytes, alignment);
+        } catch (const std::bad_alloc&) {
+            // Refuse the allocation without invalidating any range already recorded.
+        }
+    }
+    ReleaseSRWLockExclusive(&allocator_lock);
+    return reinterpret_cast<void*>(allocation.cpu);
+}
+
+UINT64 list_upload_gpu(Wrapper* self, UINT64 address, UINT64 bytes)
+{
+    AcquireSRWLockShared(&allocator_lock);
+    const auto& state = self->own();
+    const auto gpu = state.list_open && state.list_uploads ? state.list_uploads->translate(address, bytes) : 0;
+    ReleaseSRWLockShared(&allocator_lock);
+    return gpu;
+}
+
+// Fixture lookup. The full range must belong to this list's open recording.
+extern "C" __declspec(dllexport) UINT64 x2w_d3d12_upload_gpu_address(void* list, const void* cpu, UINT64 bytes)
+{
+    Wrapper* self = as_wrapper(list);
+    return self && self->own().kind == list_kind && cpu && bytes
+        ? list_upload_gpu(self, reinterpret_cast<UINT64>(cpu), bytes) : 0;
+}
+
 // Allocator slot 8, desktop Reset().
 HRESULT __stdcall allocator_reset(Wrapper* self)
 {
@@ -1150,6 +1196,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
     if (next) {
         hr = next->real->Reset();
         if (SUCCEEDED(hr)) {
+            next->uploads.clear();
             next->submits.clear();
             next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
@@ -1240,6 +1287,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             target = nullptr;
             for (DesktopAllocator* spare : title.pool) {
                 if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
+                    spare->uploads.clear();
                     spare->submits.clear();
                     spare->close_failed = false;
                     target = spare;
@@ -1282,6 +1330,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
             if (on) --on->lists;
             on = title.current;
             ++on->lists;
+            state.list_uploads = nullptr;
             state.list_ready = false;
             state.list_open = true;
         }
@@ -1800,6 +1849,7 @@ struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
     bool compute_root = false;
+    const std::vector<RootParameter>* compute_params = nullptr;
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -1914,6 +1964,40 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
 }
 // List slot 33 (desktop 29 + 4), SetComputeRootSignature.
+// Slot 26: the console's UAV records have the desktop layout, with wrapped resource pointers.
+// Desktop transitions are owned by the shim, so the other barrier types are left unhandled.
+UINT __stdcall list_resource_barriers(Wrapper* self, UINT count, const D3D12_RESOURCE_BARRIER* barriers)
+{
+    static_assert(sizeof(D3D12_RESOURCE_BARRIER) == 32);
+    UINT forwarded = 0;
+    auto* list = recording(self);
+    const auto type = list ? list->GetType() : D3D12_COMMAND_LIST_TYPE_COPY;
+    if ((type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE) &&
+        count && barriers && x2w_local::readable(barriers, std::size_t{count} * sizeof(*barriers))) {
+        for (UINT i = 0; i < count; ++i) {
+            D3D12_RESOURCE_BARRIER barrier;
+            std::memcpy(&barrier, barriers + i, sizeof(barrier));
+            if (barrier.Type != D3D12_RESOURCE_BARRIER_TYPE_UAV || barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE)
+                continue;
+            if (barrier.UAV.pResource) {
+                Wrapper* resource = as_wrapper(barrier.UAV.pResource);
+                if (!resource || resource->own().kind != resource_kind || !resource->own().real) continue;
+                auto* real = static_cast<ID3D12Resource*>(resource->own().real);
+                if (!(real->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) continue;
+                Microsoft::WRL::ComPtr<ID3D12Device> owner;
+                if (FAILED(real->GetDevice(IID_PPV_ARGS(&owner))) || owner.Get() != device_of(self->own().list_device)) continue;
+                barrier.UAV.pResource = real;
+            }
+            list->ResourceBarrier(1, &barrier);
+            ++forwarded;
+        }
+    }
+    static LONG reports;
+    if (count && first_calls(reports, 8))
+        log("x2w-d3d12 CommandList::slot26(ResourceBarrier): forwarded=%u refused=%u", forwarded, count - forwarded);
+    return 0; // no console barrier actions to perform on the caller's side
+}
+
 void __stdcall list_compute_root(Wrapper* self, void* root)
 {
     auto* list = recording(self);
@@ -1921,6 +2005,7 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
     pass.compute_root = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
+    pass.compute_params = pass.compute_root ? root_info(w) : nullptr;
     if (pass.compute_root) list->SetComputeRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
 }
 
@@ -2262,6 +2347,17 @@ void __stdcall list_stencil_ref(Wrapper* self, UINT reference)
 {
     if (auto* list = recording(self)) list->OMSetStencilRef(reference);
 }
+// List slot 43, set a compute root SRV backed by this recording's upload pages.
+void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 address)
+{
+    auto* list = recording(self);
+    const auto* params = pass_of(self).compute_params;
+    if (!list || !params || parameter >= params->size() ||
+        (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
+    const auto gpu = list_upload_gpu(self, address, 1);
+    if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) list->SetComputeRootShaderResourceView(parameter, gpu);
+}
+
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
 void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
 {
@@ -2273,6 +2369,12 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
     if (!list || !pass.root || pass.root_heap_flags || parameter >= pass.root->size() || parameter >= 32 ||
         (*pass.root)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV)
         return;
+    if (const auto gpu = list_upload_gpu(self, address, 1)) {
+        if (gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) return;
+        list->SetGraphicsRootShaderResourceView(parameter, gpu);
+        pass.srv_bound |= 1u << parameter;
+        return;
+    }
     const std::size_t bytes = readable_window(address, 0x10000);
     const D3D12_GPU_VIRTUAL_ADDRESS desktop = bytes ? upload_from_title(address, bytes) : 0;
     static LONG logged;
@@ -3683,6 +3785,7 @@ void build_tables()
         list_typed[9] = reinterpret_cast<ListTyped>(&list_close);
         list_typed[52] = reinterpret_cast<ListTyped>(&list_clear_target);
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
+        list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
         list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
@@ -3690,9 +3793,11 @@ void build_tables()
         list_typed[23] = reinterpret_cast<ListTyped>(&list_blend_factor);
         list_typed[24] = reinterpret_cast<ListTyped>(&list_stencil_ref);
         list_typed[25] = reinterpret_cast<ListTyped>(&list_pipeline);
+        list_typed[x2w_list_slots::resource_barrier_slot] = reinterpret_cast<ListTyped>(&list_resource_barriers);
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[33] = reinterpret_cast<ListTyped>(&list_compute_root);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
+        list_typed[43] = reinterpret_cast<ListTyped>(&list_compute_upload_srv);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
