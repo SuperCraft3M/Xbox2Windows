@@ -19,7 +19,42 @@ bool tiled_bc_srv(const D3D12_RESOURCE_DESC& r)
            static_cast<UINT>(r.Layout) == 0x105 && r.Alignment == 0 &&
            (r.Flags == D3D12_RESOURCE_FLAG_NONE || static_cast<UINT>(r.Flags) == 0x300000) &&
            r.Width <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION && r.Height <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
-           r.Width % 64 == 0 && r.Height % 64 == 0;
+           // A single mip pads its pitch and height to whole 4 KiB tiles (Bc16Surface); the desktop
+           // texture needs whole 4x4 blocks.
+           r.Width && r.Height && r.Width % 4 == 0 && r.Height % 4 == 0;
+}
+
+// One line for the first publication of a view whose last tile row or column is partial. A published
+// view gets a content summary, so a title run can tell console-tiled data from zeros; a held one names
+// why it stays refused.
+void log_partial_tile_view(const D3D12_RESOURCE_DESC& r, u64 address, const char* held, bool published)
+{
+    static LONG lines, unpublished;
+    const auto bytes = x2w_startup::Bc16Surface(r).size();
+    if (!published) {
+        if (first_calls(unpublished, 8))
+            log("x2w-d3d12 Device::slot70 partial-tile BC view %llux%u format %d layout 0x%x: %s, %llu tiled bytes",
+                r.Width, r.Height, r.Format, static_cast<unsigned>(r.Layout), held ? held : "texture_unavailable", bytes);
+        return;
+    }
+    if (!first_calls(lines, 64)) return;
+    const auto* data = reinterpret_cast<const unsigned char*>(address);
+    const auto nonzero = [&](u64 from) {
+        unsigned count = 0;
+        for (u64 i = from; i < from + 4096; ++i) count += data[i] != 0;
+        return count;
+    };
+    // publish_tiled_texture already found the whole range readable.
+    log("x2w-d3d12 Device::slot70 partial-tile BC view %llux%u format %d layout 0x%x: published, %llu tiled bytes, "
+        "nonzero first/last 4 KiB %u/%u hash %016llx", r.Width, r.Height, r.Format, static_cast<unsigned>(r.Layout),
+        bytes, nonzero(0), nonzero(bytes - 4096), hash_memory(data, static_cast<std::size_t>(bytes)));
+}
+
+// The size the XG stand-in reports for a description: desktop copyable footprints rounded to 64 KiB.
+u64 xg_reported_bytes(Wrapper* device, const D3D12_RESOURCE_DESC& desc)
+{
+    const x2w_startup::SliceFootprints plan(device_of(device), sanitized(desc), 1);
+    return plan.size == UINT64_MAX ? 0 : (plan.size + 0xFFFF) & ~u64{0xFFFF};
 }
 
 bool supports_memory_srv(const D3D12_RESOURCE_DESC& r, const D3D12_SHADER_RESOURCE_VIEW_DESC& v)
@@ -133,6 +168,20 @@ struct TiledAddressTexture {
 std::unordered_map<Wrapper*, TiledAddressTexture> tiled_srv_textures;
 std::unordered_multimap<u64, Wrapper*> tiled_srv_addresses;
 
+bool partial_tiled_bc(const D3D12_RESOURCE_DESC& desc)
+{
+    return tiled_bc_srv(desc) && (desc.Width % 64 || desc.Height % 64);
+}
+
+bool latest_texture_write_is_rows(u64 address)
+{
+    AcquireSRWLockShared(&written_lock);
+    const auto found = written_textures().find(address);
+    const bool rows = found != written_textures().end() && found->second.desktop_rows;
+    ReleaseSRWLockShared(&written_lock);
+    return rows;
+}
+
 Wrapper* publish_tiled_texture(Wrapper* device, u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     const auto bytes = x2w_startup::bc64::supports(desc) ? x2w_startup::bc64::Chain(desc).bytes() : x2w_startup::Bc16Surface(desc).size();
@@ -164,6 +213,10 @@ ID3D12Resource* sampled_address_texture(Wrapper* resource)
     if (!resource->own().tiled_address_srv) return static_cast<ID3D12Resource*>(resource->own().real);
     std::lock_guard lock(tiled_srv_mutex);
     auto& sampled = tiled_srv_textures.at(resource);
+    // An already-published token can outlive a write in a different layout.
+    if (partial_tiled_bc(sampled.desc) &&
+        latest_texture_write_is_rows(reinterpret_cast<u64>(resource->own().title_memory)))
+        return nullptr;
     if (!sampled.desktop) {
         const auto desc = sanitized(sampled.desc);
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -230,11 +283,27 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
         view_slot<18, 2>(self, reinterpret_cast<u64>(buffer), reinterpret_cast<u64>(&adjusted), destination, 0);
         return;
     }
-    Wrapper* texture = (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
+    // A partial-tile view stays refused when the last XG stand-in copy to the address wrote desktop-footprint
+    // rows, or when its padded tiles run past the size the stand-in reported, which the title may not own.
+    bool first = false;
+    const char* held = nullptr;
+    if (partial_tiled_bc(*resource)) {
+        {
+            std::lock_guard lock(tiled_srv_mutex);
+            first = !tiled_srv_addresses.count(input->address);
+        }
+        if (latest_texture_write_is_rows(input->address)) held = "partial_tile_xg_rows";
+        else if (x2w_startup::Bc16Surface(*resource).size() > xg_reported_bytes(self, *resource))
+            held = "partial_tile_beyond_xg_size";
+    }
+    Wrapper* texture = held ? nullptr
+        : (tiled_bc_srv(*resource) || x2w_startup::bc64::supports(*resource)) ? publish_tiled_texture(self, input->address, *resource)
                                               : existing_memory_texture(input->address, *resource);
+    if (first) log_partial_tile_view(*resource, input->address, held, texture != nullptr);
     if (!texture) {
         if (first_calls(refused, 8))
-            log_refused_memory_srv("unavailable texture at the supplied base and layout", "texture_unavailable", resource, input, destination);
+            log_refused_memory_srv("unavailable texture at the supplied base and layout", held ? held : "texture_unavailable",
+                                   resource, input, destination);
         return;
     }
     view_slot<18, 2>(self, reinterpret_cast<u64>(texture), reinterpret_cast<u64>(&input->view), destination, 0);

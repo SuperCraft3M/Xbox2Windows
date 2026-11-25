@@ -11472,11 +11472,32 @@ ctest --preset release --no-tests=error -R '^(startup_memory_srv_report|startup_
 
 The translated draw path can sample a read-only BC3_UNORM or BC7_UNORM SRV
 published through device slot 70 without a prior resource object. The tested
-layout is 0x105, 4 KiB standard non-XOR. Width and height must be multiples of
-64 texels, with one mip, one slice, and one sample. Each tile holds 16 by 16
-compressed blocks. The runtime copies the 16-byte blocks to their desktop
-footprint rows before uploading them. Ordinary placed R8 views and the XG
-BC7 layout probe retain their existing behavior.
+layout is 0x105, 4 KiB standard non-XOR. Width and height must be whole 4x4
+blocks, with one mip, one slice, and one sample. Each tile holds 16 by 16
+compressed blocks. A partial last tile column or row is padded to a whole tile,
+as AMD addrlib does for a single-mip thin surface (Mesa
+`5c142e46f3f6e752ed745fd48912ebb8fad67145`, `src/amd/addrlib/src/gfx10/gfx10addrlib.cpp`):
+`ComputeSurfaceInfoMacroTiled` aligns pitch and height to the block size, with
+no mip tail for one mip, and `ComputeSurfaceAddrFromCoordMacroTiled` takes a
+block's tile index as its block row times the tiles per padded pitch, plus its
+block column. The runtime copies the visible 16-byte blocks to their desktop
+footprint rows before uploading them. Ordinary placed R8 views and the XG BC7
+layout probe retain their existing behavior.
+
+A view with a partial last tile stays refused in two cases. The first is when
+the last copy the XG stand-in announced to that address wrote desktop-footprint
+rows, not tiles, whether that copy came before the first publication there or
+after it. A copy from the opt-in BC7 4 KiB layout writes tiles and does not hold
+the view. A row copy leaves previously published descriptor bytes intact,
+and the translated sampler binds a null texture while the last write is a row
+copy. It can sample the view again after a tiled write is announced.
+The second is when the padded tiles are larger than the size the XG stand-in
+reports for the description (the desktop footprint rounded to 64 KiB): the
+bytes past that size may belong to something else, and a readability probe
+cannot tell. For example, 1028 by 1028 pads to 1,183,744 bytes against a
+reported 1,179,648. The first publication at an address of a partial-tile view
+logs its size, format, tiled byte count, and how many of the first and last
+4 KiB are non-zero, with a hash; a refused one logs its reason instead.
 
 Keep the complete tiled guest allocation readable for the view's sampling
 lifetime. The producer stores the view identity in the title heap. The
@@ -11493,9 +11514,30 @@ RTX 4060 Laptop (32.0.16.1656) and WARP (10.0.26100.9818) each matched
 65,536 RGBA pixels per format. The swapped-tile control changed 16,384
 of 16,384 pixels for BC3 and 15,360 for BC7.
 
+The same test draws a 100 by 68 texture of each format from the same four
+tiles, whose last tile column and row are partial. The padding blocks hold
+distinct valid blocks; texels outside the texture must load as zero, and the
+log must report 16,384 tiled bytes. A reference that uses the tile pitch of the
+unpadded width (one tile instead of two) differs from the image in 1,600 pixels
+for BC3 and 1,500 for BC7. The test also requires refusals for 98 by 68 and
+100 by 66 (not whole blocks), 1028 by 1028 (past the reported size) and a
+100 by 68 view over memory announced as an XG copy, and a second request for a
+100 by 68 address after a row copy over its published view; that request must
+leave the destination descriptor naming the view it held. A draw through the
+already-published token after a row write must read zero. The test requires publication of
+a 256 by 196 view, whose padded size equals the reported 64 KiB and whose width
+is whole tiles, and of a 100 by 68 view over memory announced by the opt-in BC7
+copy. Each of these changes makes the test fail: restoring the 64-texel check,
+dropping the height check, requiring both dimensions to be partial, refusing at
+an equal size, dropping the announced-copy refusal, ignoring which copy was
+announced, or rounding the tile rows down in `Bc16Surface`. The last also fails
+`startup_bc7_4k_s`. On Windows 11 build
+26300 with the debug layer off, RTX 5090 (32.0.16.2135) and WARP
+(10.0.26100.10068) matched all 65,536 RGBA pixels per case.
+
 ```powershell
 cmake --build --preset release --target startup_stream_consumer startup_stub_consumer d3d12_xs_shim
-ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|bc7_tile_swizzle)$'
+ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|startup_bc7_4k_s|bc7_tile_swizzle)$'
 ```
 
 ### Six BC5/BC7 mips on a 64 KiB standard layout

@@ -2556,6 +2556,7 @@ extern SRWLOCK written_lock;
 struct TextureWrite {
     u64 generation = 0;
     UINT bc7_width = 0, bc7_height = 0;
+    bool desktop_rows = false;  // the last XG copy wrote desktop-footprint rows (not the opt-in BC7 tiles)
 };
 std::unordered_map<u64, TextureWrite>& written_textures();
 ID3D12Resource* sampled_address_texture(Wrapper* resource);
@@ -3963,6 +3964,7 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
     ++written.generation;
     written.bc7_width = bc7_width;
     written.bc7_height = bc7_height;
+    written.desktop_rows = !bc7_width;
     ReleaseSRWLockExclusive(&written_lock);
 }
 }  // namespace

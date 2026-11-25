@@ -3,11 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <vector>
 
 using Word = std::uint64_t;
 Word invoke(void*, unsigned, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0, Word = 0);
+extern "C" __declspec(dllimport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes);
+extern "C" __declspec(dllimport) void x2w_d3d12_bc7_4k_s_written(void* base, UINT width, UINT height);
 namespace {
 template<class T> Word ptr(T* value) { return reinterpret_cast<Word>(value); }
 struct ViewAt {
@@ -139,7 +142,13 @@ int draw_bc_address_srvs(void* guest, void* list)
     const DWORD length = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", path, MAX_PATH);
     if (!length || length >= MAX_PATH) return 43;
     const bool bc3 = GetEnvironmentVariableW(L"X2W_TEST_BC3", nullptr, 0) != 0;
-    constexpr UINT tile = 4096, width = 128, height = 128;
+    // X2W_TEST_BC_SIZE=<width>x<height> (default 128x128) keeps the 2x2 tiles; a smaller size leaves the
+    // last tile column and row partial, so the padding blocks must stay outside the texture.
+    constexpr UINT tile = 4096, panel = 128;
+    UINT width = panel, height = panel;
+    wchar_t size[16]{};
+    if (GetEnvironmentVariableW(L"X2W_TEST_BC_SIZE", size, 16) &&
+        (swscanf_s(size, L"%ux%u", &width, &height) != 2 || width > panel || height > panel)) return 43;
     alignas(4096) static std::array<std::array<char, 4 * tile>, 2> backing{};
     std::ifstream input(path, std::ios::binary);
     if (!input.read(backing[0].data(), 4 * tile) || input.peek() != std::char_traits<char>::eof()) return 43;
@@ -159,9 +168,56 @@ int draw_bc_address_srvs(void* guest, void* list)
     for (LONG i = 0; i < 4; ++i) {
         v.address = addresses[i];
         invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
-        const D3D12_RECT region{i * LONG(width), 0, (i + 1) * LONG(width), LONG(height)};
+        // Keep the already-published descriptor while the backing changes to a row layout.
+        if (i == 3 && (width % 64 || height % 64))
+            x2w_d3d12_texture_written(backing[0].data(), backing[0].size());
+        const D3D12_RECT region{i * LONG(panel), 0, (i + 1) * LONG(panel), LONG(panel)};
         invoke(list, 22, 1, ptr(&region));
         invoke(list, 12, 3, 1);
+    }
+    // Refused, with nothing drawn after them (the check reads the log): not whole 4x4 blocks in either
+    // direction, and padded tiles past the size XG reports (1028 x 1028 pads to 1,183,744 bytes; the
+    // footprint rounded to 64 KiB is 1,179,648).
+    const auto refused = [&](UINT64 w, UINT h) {
+        auto shape = desc;
+        shape.Width = w;
+        shape.Height = h;
+        v.address = ptr(backing[1].data());
+        invoke(guest, 70, ptr(&shape), ptr(&v), cpu);
+    };
+    refused(width - 2, height);
+    refused(width, height - 2);
+    refused(1028, 1028);
+    // Published at the boundary: 256 x 196 (only the height partial) pads to 64 KiB, exactly the reported size.
+    alignas(4096) static std::array<char, 16 * tile> boundary{};
+    auto exact = desc;
+    exact.Width = 256;
+    exact.Height = 196;
+    v.address = ptr(boundary.data());
+    invoke(guest, 70, ptr(&exact), ptr(&v), cpu);
+    // A partial-tile view over memory the XG stand-in announced as copied rows stays refused; over blocks
+    // its opt-in BC7 4 KiB copy announced as tiled, it is published. Only partial sizes are affected.
+    if (width % 64 || height % 64) {
+        alignas(4096) static std::array<std::array<char, 4 * tile>, 2> announced{};
+        x2w_d3d12_texture_written(announced[0].data(), announced[0].size());
+        x2w_d3d12_bc7_4k_s_written(announced[1].data(), width, height);
+        for (const auto& backing : announced) {
+            v.address = ptr(backing.data());
+            invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        }
+        // Published first, then overwritten by an XG row copy: a second request is refused and leaves the
+        // destination naming the view it held before (the second backing's).
+        alignas(4096) static std::array<char, 4 * tile> reused{};
+        v.address = ptr(reused.data());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        v.address = ptr(backing[1].data());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        v.address = ptr(reused.data());
+        std::array<char, 32> written{};
+        std::memcpy(written.data(), reinterpret_cast<const void*>(cpu), written.size());
+        x2w_d3d12_texture_written(reused.data(), reused.size());
+        invoke(guest, 70, ptr(&desc), ptr(&v), cpu);
+        if (std::memcmp(written.data(), reinterpret_cast<const void*>(cpu), written.size())) return 44;
     }
     return 0;
 }
