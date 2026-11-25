@@ -11540,6 +11540,69 @@ cmake --build --preset release --target startup_stream_consumer startup_stub_con
 ctest --preset release --no-tests=error --output-on-failure -R '^(startup_address_(bc_view|srv)_(hardware|warp)|startup_xg_bc7_layout|startup_bc7_4k_s|bc7_tile_swizzle)$'
 ```
 
+### Sample by-address textures of the non-XOR console layouts
+
+Slot 70 took a few texture shapes without a resource object (the R8 plane of an existing resource,
+the single texel, the `0x105` BC3/BC7 view above and the `0x109` BC chains below; those keep their
+own paths) and refused every other description, which leaves the destination descriptor as it was.
+It now also takes a two-dimensional,
+single-sample, sampled-only texture with a known element size whose layout is `0x101`, `0x102`,
+`0x105`, `0x106`, `0x109` or `0x10a`, and reads it in that console layout, mip tail and array slices
+included. Layout `0` and the linear mode `0x100` are refused as before: `startup_address_srv` still
+runs in the default configuration, and its mismatched-width and interior-address calls stay refused.
+The accepted descriptions, views, limits and log lines are listed in `docs/startup-runtime.md`
+("Textures published by address").
+
+`startup_gfx10_layout` needs no device. It compares `src/startup_stubs/gfx10_layout.h` with the 30
+one-pipe equations of AMD addrlib's `GFX10_SW_{256,4K,64K}_{S,D}_PATINFO` rows written out in the test
+(five element sizes for each of the six modes), with `bc7_4k_s.h` on five 4 KiB surfaces, with
+`bc64_chain.h` on eight 64 KiB chains and with `tile64_plan.h` on ten tile plans; it tiles and
+detiles nine textures back to their bytes, and lists 11 refused layouts, 15 slot 70 descriptions and
+16 views on each side of the accepted set. `startup_gfx10_layout_display_control` reads the `0x10a`
+order as `0x109` and must fail. The addrlib reference is the revision `tools/fetch_addrlib.py` pins
+(Mesa 25.1.0, commit `5c142e46f3f6e752ed745fd48912ebb8fad67145`, `src/amd/addrlib`, MIT); the files
+and their notice ("Copyright (C) 2007-2024 Advanced Micro Devices, Inc. All rights reserved.",
+`SPDX-License-Identifier: MIT`) are named in the header and in both fixtures.
+[AMD addrlib revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib)
+
+`startup_address_console_{warp,hardware}` builds the backing bytes in Python from the same addrlib
+rows, independently of the header, publishes them through slot 70 with no resource object, and
+compares all 65,536 RGBA pixels of a 512 by 128 target for each of seven textures: RGBA8 96 by 40
+and BC1 192 by 96 at `0x105`, BC1 256 by 128 at `0x10a`, mips 1, 2 and 3 of a four-mip RGBA8 256 by
+256 chain at `0x10a` (mips 2 and 3 are in the mip tail), and RGBA8 40 by 24 at `0x101`. Each run must
+also log `slot70 texture kind 1: published console layout`. Two held descriptions follow: the first
+texture again over an address announced as an XG copy of rows (`console_layout_xg_rows`), and
+RGBA8 257 by 257 at `0x109`, whose nine 64 KiB blocks run past the 393,216 bytes the XG stand-in
+reports (`console_layout_beyond_xg_size`). Both must log their reason, publish nothing and read the
+null view at every pixel. Last, the first texture is published and its address is then announced as
+an XG copy of rows before the draw; the published view must read the null view at every pixel, as
+a partial-tile BC view does after a later row copy.
+
+An upload of a console-layout texture owns its upload buffer. The buffer and the texture stay referenced
+by the recording and by each submit of it until the queue has completed that submit; the shared
+upload ring, which is reused without waiting for a queue, is not used. `startup_address_console_gate_{warp,hardware}`
+makes the queue wait on a fence the fixture holds (queue slot 17), then records and submits eighteen
+lists on one list object, resetting the allocator and the list between them. Each republishes one
+2048 by 2048 RGBA8 texture at `0x109` (16 MiB) from the same address with a new payload and draws it,
+payload 0 over the left half of the target and the others over the right half. No submit may complete
+before the fixture signals the fence. After the last one completes, the left half must hold payload 0
+and the right half payload 17, and the log must report eighteen retained submits released.
+`startup_address_console_gate_ring_{warp,hardware}` is the control: with
+`X2W_TEST_ADDRESS_UPLOAD_RING=1` (fixtures only) the same uploads come from the 256 MiB ring, the
+later ones pass over the bytes of payload 0 before the queue copies them, and the left half must not
+hold payload 0.
+
+The equations are checked against addrlib and against the three existing layout headers, not against
+console memory. Which layouts a given console build writes for which textures is not established by
+these fixtures. The gate fixture covers one direct queue, one texture and uploads recorded by draws;
+it does not cover a release of the desktop texture, which this change never does.
+
+```powershell
+cmake --build --preset release --target startup_gfx10_layout_check startup_stream_consumer
+ctest --preset release --no-tests=error --output-on-failure -R '^startup_gfx10_layout'
+ctest --preset release --no-tests=error --output-on-failure -j 1 -R '^startup_address_(console|console_gate|console_gate_ring|bc_view|srv)_(hardware|warp)$'
+```
+
 ### Six BC5/BC7 mips on a 64 KiB standard layout
 
 `startup_xg_bc_chain_{warp,hardware}` uses a source-built 1024×1024 BC5_UNORM or BC7_UNORM texture with six mip levels, one slice, one sample, explicit layout `0x109` (64 KiB standard, no XOR), default alignment and zero flags. The guest chain occupies `0x160000` bytes. The six offsets starting at mip 0 are `0x60000, 0x20000, 0x10000, 0x8000, 0x4000, 0x2000`. The three smallest mips share tile zero. These offsets and all 87,360 visible block addresses were checked with `Addr2ComputeSurfaceInfo` and `Addr2ComputeSurfaceAddrFromCoord` on the pinned Navi21 configuration. [AMD addrlib revision](https://gitlab.freedesktop.org/mesa/mesa/-/tree/5c142e46f3f6e752ed745fd48912ebb8fad67145/src/amd/addrlib) · [XCL comparison](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/gpu/tiling.rs)

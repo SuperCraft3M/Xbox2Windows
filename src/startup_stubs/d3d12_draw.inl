@@ -560,6 +560,74 @@ void retire_draw_sampler_heaps(ID3D12CommandQueue* queue, const std::vector<ID3D
     submitted_draw_sampler_heaps.push_back(std::move(batch));
 }
 
+// A texture published by address (address_texture.h) is not filled through the shared upload ring.
+// The ring is reused without waiting for any queue, and a queue held behind a fence can execute a
+// recorded copy long after later uploads have passed over its source bytes. Each such upload owns
+// its upload buffer instead. The buffer and the texture it fills stay referenced by the recording,
+// and by every submit of that recording until the queue it went to has completed the submit, as
+// for the sampler heaps above.
+struct AddressUpload {
+    x2w_startup::ComPtr<ID3D12Resource> buffer, texture;
+};
+std::unordered_map<ID3D12CommandList*, std::vector<AddressUpload>> recorded_address_uploads;
+struct SubmittedAddressUploads {
+    x2w_startup::ComPtr<ID3D12Fence> fence;
+    std::vector<AddressUpload> uploads;
+};
+std::vector<SubmittedAddressUploads> submitted_address_uploads;
+
+// X2W_TEST_ADDRESS_UPLOAD_RING=1 (fixtures only): fill by-address textures from the shared upload ring,
+// without the buffers above. The control of startup_address_console_gate runs with it.
+bool address_uploads_from_ring()
+{
+    static const bool on = GetEnvironmentVariableW(L"X2W_TEST_ADDRESS_UPLOAD_RING", nullptr, 0) != 0;
+    return on;
+}
+
+void discard_address_uploads(ID3D12CommandList* list)
+{
+    AcquireSRWLockExclusive(&draw_lock);
+    recorded_address_uploads.erase(list);
+    ReleaseSRWLockExclusive(&draw_lock);
+}
+
+// draw_lock held. The lists have already been executed on this queue. Each submit takes its own
+// references; they are dropped by a later call, once the fence signalled behind the submit has
+// completed. A submit whose fence could not be made or signalled keeps its references.
+void retire_address_uploads(ID3D12CommandQueue* queue, const std::vector<ID3D12CommandList*>& lists)
+{
+    static std::size_t peak, released;
+    const std::size_t before = submitted_address_uploads.size();
+    submitted_address_uploads.erase(std::remove_if(submitted_address_uploads.begin(),
+        submitted_address_uploads.end(), [](const SubmittedAddressUploads& batch) {
+            return batch.fence && batch.fence->GetCompletedValue() != 0;
+        }), submitted_address_uploads.end());
+    if (const std::size_t gone = before - submitted_address_uploads.size()) {
+        released += gone;
+        static LONG reports;
+        if (first_calls(reports, 12))
+            log("x2w-draw by-address uploads: %zu submits completed and released (%zu so far, %zu still pending, at most %zu pending)",
+                gone, released, submitted_address_uploads.size(), peak);
+    }
+    SubmittedAddressUploads batch;
+    for (auto* list : lists) {
+        const auto it = recorded_address_uploads.find(list);
+        if (it == recorded_address_uploads.end()) continue;
+        for (const auto& upload : it->second) batch.uploads.push_back(upload);
+    }
+    if (batch.uploads.empty()) return;
+    x2w_startup::ComPtr<ID3D12Device> device;
+    HRESULT hr = queue->GetDevice(IID_PPV_ARGS(&device));
+    if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&batch.fence));
+    if (SUCCEEDED(hr)) hr = queue->Signal(batch.fence.Get(), 1);
+    if (FAILED(hr)) {
+        batch.fence.Reset();
+        log("x2w-draw by-address upload retirement fence failed 0x%08lx", static_cast<unsigned long>(hr));
+    }
+    submitted_address_uploads.push_back(std::move(batch));
+    peak = (std::max)(peak, submitted_address_uploads.size());
+}
+
 bool resolve_draw_sampler(const x2w_startup::SamplerWords& words, D3D12_SAMPLER_DESC& sampler)
 {
     if (words[0] != view_token_magic) {
@@ -720,8 +788,13 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     const auto* original = resource_info(resource);
     const bool tiled_chain = original && x2w_startup::bc64::supports(original->console);
     const bool tiled_address = resource->own().tiled_address_srv;
+    // Any other texture slot 70 publishes holds its texels in the console layout its description names
+    // (gfx10_layout.h, address_texture.h).
+    const bool console = tiled_address && !single && !tiled_chain && original && console_layout_srv(original->console);
     const bool tiled_bc7 = !tiled_chain && !tiled_address && written.bc7_width != 0;
     const bool tiled = tiled_bc7 || tiled_address || tiled_chain;
+    std::optional<x2w_startup::gfx10::Layout> console_layout;
+    if (console) console_layout.emplace(original->console);
     const auto generation = written.generation;
     const x2w_startup::Bc16Surface surface(tiled_bc7 ? written.bc7_width : static_cast<UINT>(desc.Width),
                                          tiled_bc7 ? written.bc7_height : desc.Height);
@@ -731,9 +804,17 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             desc.Format != DXGI_FORMAT_BC7_UNORM || desc.Width != surface.columns * surface.block_texels ||
             desc.Height != surface.rows * surface.block_texels) return;
     }
-    if (tiled && !tiled_chain && !single && (plan.count != 1 || plan.rows[0] != surface.rows ||
+    if (tiled && !tiled_chain && !single && !console && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
-    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
+    if (console) {
+        // The desktop footprints must hold exactly the elements the console layout addresses.
+        if (console_layout->mips != mips || console_layout->slices != slices) return;
+        for (UINT i = 0; i < mips; ++i)
+            if (plan.rows[i] != console_layout->rows(i) ||
+                plan.row_bytes[i] != u64{console_layout->columns(i)} * console_layout->bytes_per_element) return;
+    }
+    const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : console ? console_layout->bytes()
+        : tiled && !single ? surface.size() : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
     // A single texel (at most 16 bytes) is rehashed on every bind, so a write between two draws is seen.
@@ -752,8 +833,47 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
         state.generation = generation;
         return;
     }
+    // 512: D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, the offset of each footprint in its upload buffer.
+    constexpr u64 placement = 512;
+    x2w_upload::Page owned;
+    if (console && !address_uploads_from_ring()) {
+        u64 bytes = 0;
+        for (UINT i = 0; i < mips; ++i) bytes += (plan.bytes(i) + placement - 1) & ~(placement - 1);
+        bytes *= slices;
+        if (!bytes || FAILED(x2w_upload::make_page(device_of(the_device), bytes, owned))) {
+            state.done = false;
+            return;
+        }
+        std::memset(owned.cpu, 0, static_cast<std::size_t>(bytes));
+    }
     require_state(self, texture, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (tiled_chain) {
+    if (console) {
+        for (UINT slice = 0; slice < slices; ++slice) {
+            for (UINT i = 0; i < mips; ++i) {
+                const u64 bytes = plan.bytes(i);
+                u64 offset = owned.cursor;
+                unsigned char* rows = owned.cpu ? owned.cpu + offset : nullptr;
+                if (owned.cpu) {
+                    owned.cursor += (bytes + placement - 1) & ~(placement - 1);
+                } else {
+                    rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
+                    if (!rows) {
+                        state.done = false;
+                        return;
+                    }
+                    std::memset(rows, 0, static_cast<std::size_t>(bytes));
+                }
+                console_layout->detile(i, slice, memory, rows, plan.placed[i].Footprint.RowPitch);
+                plan.upload(list, texture, owned.cpu ? owned.resource.Get() : upload_ring, mips, slices, slice, i, offset);
+            }
+        }
+        if (owned.cpu) {
+            AddressUpload upload;
+            upload.buffer = owned.resource.Get();
+            upload.texture = texture;
+            recorded_address_uploads[list].push_back(std::move(upload));
+        }
+    } else if (tiled_chain) {
         const x2w_startup::bc64::Chain chain(original->console);
         for (UINT slice = 0; slice < slices; ++slice) {
             for (UINT i = 0; i < mips; ++i) {

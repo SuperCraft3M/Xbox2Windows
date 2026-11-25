@@ -240,7 +240,9 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
                       DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
-    const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
+    const bool console_view = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_VIEW", nullptr, 0) != 0;
+    const bool console_gate = GetEnvironmentVariableW(L"X2W_TEST_CONSOLE_GATE", nullptr, 0) != 0;
+    const bool bc = console_view || console_gate || GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
     const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
     // The translated MRT formats draw one pixel; the other formats keep the 8x4 target.
@@ -322,7 +324,51 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
         if (bc7) invoke(list, 36, 0, binding.table);
         invoke(list, 12, 3, 1);
     }
-    if (bc) {
+    if (console_view) {
+        extern int draw_console_address_srv(void*, void*);
+        if (const int result = draw_console_address_srv(guest, list)) return result;
+    } else if (console_gate) {
+        // X2W_TEST_CONSOLE_GATE: the queue waits on a fence this fixture holds while eighteen lists are
+        // recorded and submitted on one list object, each after a new payload was written at the same
+        // address (draw_gated_console_payload). Nothing may complete before the fence is signalled; the
+        // target is read back after the last submit has completed.
+        extern int draw_gated_console_payload(void*, void*, unsigned, bool);
+        constexpr unsigned payloads = 18;
+        void* gate = nullptr;
+        if (FAILED(static_cast<HRESULT>(invoke(guest, 36, 0, 0, arg(&__uuidof(ID3D12Fence)), arg(&gate))))) return 44;
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 17, arg(gate), 1)))) return 45;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv{static_cast<SIZE_T>(invoke(frame.rtv_heap, 9))};
+        const auto next_recording = [&] {
+            if (FAILED(static_cast<HRESULT>(invoke(frame.allocator, 8))) ||
+                FAILED(static_cast<HRESULT>(invoke(list, 139, arg(frame.allocator))))) return false;
+            invoke(list, 50, 1, arg(&rtv));
+            invoke(list, 20, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            invoke(list, 25, arg(pso));
+            return true;
+        };
+        for (unsigned payload = 0; payload < payloads; ++payload) {
+            if (payload && !next_recording()) return 35;
+            if (const int result = draw_gated_console_payload(guest, list, payload, payload == 0)) return result;
+            invoke(list, 9);
+            invoke(queue, 10, 1, arg(&list));
+            if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payload + 1)))) return 24;
+        }
+        Sleep(250);
+        if (invoke(fence, 8) != 0) return 46;  // a submit completed although the queue was held
+        if (FAILED(static_cast<HRESULT>(invoke(gate, 10, 1)))) return 47;
+        // One more recording without a draw: its submit is where the stand-in visits the completed ones.
+        const auto reached = [&](UINT64 value) {
+            const auto deadline = GetTickCount64() + 60000;
+            while (invoke(fence, 8) < value && GetTickCount64() < deadline) Sleep(1);
+            return invoke(fence, 8) == value;
+        };
+        if (!reached(payloads)) return 25;
+        if (!next_recording()) return 35;
+        invoke(list, 9);
+        invoke(queue, 10, 1, arg(&list));
+        if (FAILED(static_cast<HRESULT>(invoke(queue, 14, arg(fence), payloads + 1))) || !reached(payloads + 1)) return 25;
+        return read_stream_target(desktop.Get(), frame, pixels);
+    } else if (bc) {
         extern int draw_bc_address_srvs(void*, void*);
         if (const int result = draw_bc_address_srvs(guest, list)) return result;
     }

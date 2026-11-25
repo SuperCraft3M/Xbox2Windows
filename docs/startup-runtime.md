@@ -1475,6 +1475,81 @@ memory-type and state rules are unchanged. The five-second `x2w-d3d12 views note
   `_walk_only_control` never uses the region information and must fail only that call count. A
   refused allocation or mapping is a capability skip (77) in the controls.
 
+## Textures published by address (device slot 70)
+
+Device slot 70 gets a resource description, a view and the address of the texels. When a live
+texture with that description exists at the address, its view is created as before. The shapes slot
+70 already read from an address keep their own paths unchanged: the single texel, the `0x105`
+BC3/BC7 surface (partial last tiles included) and the `0x109` BC chains. For any other description
+with no live texture whose `Layout` is `0x101`, `0x102`, `0x105`, `0x106`, `0x109` or `0x10a` (256 B,
+4 KiB and 64 KiB blocks in the standard and display orders, no XOR), the texels are read from the
+address in that console layout (`src/startup_stubs/address_texture.h`, device-free). A translated
+draw that samples the view copies each mip of each array slice from that layout into desktop
+footprint rows (`src/startup_stubs/gfx10_layout.h`: address equations, block sizes and mip-tail rules
+after AMD addrlib, Mesa 25.1.0, `src/amd/addrlib`, MIT). A 256 B layout is taken with one mip only.
+
+The description must be two-dimensional, at most 16384 texels a side, with 1 to 15 mips, one sample,
+no target, depth or unordered-access flag, and a format with a known element size (8- to 128-bit
+texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must be a 2D or
+2D-array view of the same typeless family whose mip and slice ranges stay inside the texture.
+Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
+the linear mode `0x100` without a live texture, three-dimensional and cube views, multisampled
+textures, the XOR swizzle modes and every other layout value. The texels must be readable and span
+at most 64 MiB.
+
+A console-layout description is held (not published, descriptor unchanged) in the two cases a
+partial-tile BC view is held for. `console_layout_xg_rows`: the latest XG stand-in copy announced
+for the address wrote desktop-footprint rows, so the bytes are not in the layout the description
+names. As for a partial-tile view, a texture already published there samples the null view while
+that is so. `console_layout_beyond_xg_size`: the layout runs past the size the XG stand-in reports
+for the description (the desktop copyable footprints of a slice rounded up to 64 KiB, times the
+slices), which the title may not own.
+
+Upload lifetime: each upload of a console-layout texture is written into an upload buffer of its own
+(`x2w_upload::make_page`), not into the shared upload ring. The recording keeps a reference to the
+buffer and to the texture until the list is reset, and each `ExecuteCommandLists` of the recording
+takes its own references and signals a fence behind the submit; a later submit drops the references
+of the submits whose fence has completed. A submit whose fence cannot be created or signalled keeps
+its references. The earlier by-address shapes keep using the shared ring as before. The desktop
+texture of a by-address texture is made on the first draw that samples it and is not released. The
+texels are compared with the uploaded copy on each frame that binds them, as for the earlier
+by-address shapes, and at once after a repeated slot 70 call for the same texture, which announces
+a write: a description and address that were published before are published again rather than
+taken as a live resource, so changed texels are uploaded again.
+
+Limits and choices that are not measured against a console:
+
+- The texels are taken in the layout the description names. The XG stand-in's default copy writes
+  rows whatever the swizzle mode; a description filled through it is held as above. A write by the
+  title itself is not told apart from one in the named layout.
+- One upload buffer is created per upload and there is no bound on the bytes uploaded in a frame.
+  A policy for releasing textures that are no longer sampled and for spreading large uploads over
+  frames is left to a follow-up.
+- Second sources for the address equations: only the 16-byte standard rows of `0x105` and `0x109`
+  are compared with another implementation in the tree (`bc7_4k_s.h`, `bc64_chain.h`);
+  `tile64_plan.h` checks the `0x10a` mip starts and tail, not the bit order. The display (`_D`)
+  rows in `gfx10_layout.h` that differ from the standard ones (1-, 8- and 16-byte elements; the 2-
+  and 4-byte display rows equal the standard rows) and the standard rows for 1-, 2-, 4- and 8-byte
+  elements are checked only against the addrlib pattern rows restated from the addrlib source text
+  in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
+  `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
+
+Log lines (stderr and `X2W_TRAP_LOG`):
+
+- `x2w-d3d12 slot70 texture kind <n>: <outcome>; first seen res{...} view{...} address=...`, once
+  for each new combination of format, layout, one or several mips, one or several slices, flags,
+  dimension, view format, view dimension and outcome (at most 200). The outcome is
+  `existing resource`, `published BC shape` (the earlier `0x105` and `0x109` BC paths),
+  `published console layout`, one of the two hold reasons or `texture_unavailable`.
+- `x2w-draw by-address uploads: <n> submits completed and released (...)`, for the first twelve
+  submits that drop retained uploads.
+
+Checks (reproduction in `docs/experiments.md`, "Sample by-address textures of the non-XOR console
+layouts"):
+
+- `ctest --preset release --no-tests=error -R '^startup_gfx10_layout' -V`
+- `ctest --preset release --no-tests=error -j 1 -R '^startup_address_console_' -V`
+
 ## Buffer memory SRVs (device slot 70)
 
 Device slot 70 (`src/startup_stubs/d3d12_memory_srv.inl`, validation in

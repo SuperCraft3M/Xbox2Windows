@@ -1806,6 +1806,16 @@ foreach(mutation IN ITEMS bc4 width clamp)
     add_test(NAME startup_tile64_plan_${mutation}_control COMMAND startup_tile64_plan_check --mutate ${mutation})
     set_tests_properties(startup_tile64_plan_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
+# Console texture layouts for the non-XOR standard and display swizzle modes (src/startup_stubs/gfx10_layout.h)
+# and the slot-70 descriptions that use them (src/startup_stubs/address_texture.h), without a device: address
+# equations against the pattern rows of AMD addrlib (Mesa 25.1.0, src/amd/addrlib, MIT), agreement with
+# bc7_4k_s.h, bc64_chain.h and tile64_plan.h, and round trips. The mutated run reads the display order as the standard one and is a negative control.
+add_executable(startup_gfx10_layout_check tests/startup_gfx10_layout_check.cpp)
+target_compile_features(startup_gfx10_layout_check PRIVATE cxx_std_17)
+target_include_directories(startup_gfx10_layout_check PRIVATE src)
+add_test(NAME startup_gfx10_layout COMMAND startup_gfx10_layout_check)
+add_test(NAME startup_gfx10_layout_display_control COMMAND startup_gfx10_layout_check --mutate display)
+set_tests_properties(startup_gfx10_layout_display_control PROPERTIES WILL_FAIL TRUE)
 add_test(NAME xg_swizzle_select COMMAND xg_swizzle_select_check)
 set_tests_properties(xg_swizzle_select PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 # Mutation control: the same comparison must identify all nine mismatches.
@@ -2387,6 +2397,19 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_bc_view_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_bc_view_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_address_console_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+            "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
+        set_tests_properties(startup_address_console_${backend} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+        # Uploads of by-address textures recorded while the queue waits on a fence keep their bytes until the
+        # queue has run them. The ring control fills them from the shared upload ring and must lose the first.
+        foreach(gate IN ITEMS gate gate-ring)
+            string(REPLACE "-" "_" gate_name "${gate}")
+            add_test(NAME startup_address_console_${gate_name}_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_console_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" "${backend}" "${gate}")
+            set_tests_properties(startup_address_console_${gate_name}_${backend} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+        endforeach()
         add_test(NAME startup_xg_bc_chain_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_xg_bc_chain_check.py"
             "$<TARGET_FILE:startup_stub_xg_xs>" "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
