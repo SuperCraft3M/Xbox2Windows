@@ -1105,6 +1105,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         }
     }
     if (vertex_first < 0) vertex_first = 0;
+    const bool trace_inputs = red_producers().traces_inputs_for(pass.trace_targets[0]);
     for (UINT i = 0; i < n; ++i) {
         const Translation::Srv& srv = tr->srvs[i];
         const D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + SIZE_T{first + i} * draw_heap_increment};
@@ -1133,6 +1134,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         if (entry_ok) std::memcpy(words, reinterpret_cast<const void*>(entry), 32);
         bool buffer_token_known = false;
         if (srv.kind >= 1 && srv.kind <= 4) {
+            const auto input_word = words[0];
             const auto dimension = srv.kind == 1 ? D3D12_SRV_DIMENSION_TEXTURE2D :
                                    srv.kind == 2 ? D3D12_SRV_DIMENSION_TEXTURE2DARRAY :
                                    srv.kind == 4 ? D3D12_SRV_DIMENSION_TEXTURE1D : D3D12_SRV_DIMENSION_TEXTURE3D;
@@ -1254,7 +1256,18 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
                 if (show) log("x2w-binding diagnostic key=%016llx srv=%u entry=0x%llx words=%08x,%08x,%08x,%08x readable=%d magic=%d known=%d shadow=%u shadow_known=%d",
                     tr->key, i, entry, words[0], words[1], words[2], words[3], entry_ok, facts.token_magic, known, shadow, shadow_known);
             }
-            count_null_binding(x2w_local::classify_null_binding(facts));
+            const auto cause = x2w_local::classify_null_binding(facts);
+            count_null_binding(cause);
+            static LONG traced_inputs;
+            if (trace_inputs && first_calls(traced_inputs, 128)) {
+                const char* status = cause == x2w_local::NullCause::none ? "bound" :
+                    x2w_local::null_cause_names[static_cast<int>(cause)];
+                const auto source = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
+                log("x2w-red input record=%ld list=%p key=%016llx srv=%u rt0=%p "
+                    "status=%s word=%08x view=%d format=%d texture=%p size=%llux%u flags=0x%x",
+                    frame_number + 1, list, tr->key, i, pass.trace_targets[0], status, input_word,
+                    desc.ViewDimension, desc.Format, texture, source.Width, source.Height, source.Flags);
+            }
             device_of(the_device)->CreateShaderResourceView(texture, texture && record.desc_bytes < 40 ? nullptr : &desc, dest);
             continue;
         }

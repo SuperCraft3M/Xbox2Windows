@@ -90,6 +90,14 @@ public:
         return interested() || (auto_count_ && !auto_last_ && frame_number + 1 >= auto_min_);
     }
 
+    bool traces_inputs_for(ID3D12Resource* target)
+    {
+        if (!target || !interested()) return false;
+        std::lock_guard guard(lock_);
+        return std::any_of(surfaces_.begin(), surfaces_.end(),
+                           [target](const Resource& surface) { return surface.Get() == target; });
+    }
+
     void observe(LONG64 sampled_frame, LONG published_frame, ID3D12Resource* surface, bool matched)
     {
         if (!auto_count_ || auto_last_) return;
