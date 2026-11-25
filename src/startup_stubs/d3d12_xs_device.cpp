@@ -1413,7 +1413,36 @@ SRWLOCK shown_lock = SRWLOCK_INIT;
 char shown_note[160] = "no frame read back yet";
 
 void write_file(const wchar_t* path, const void* data, std::size_t bytes);
-void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
+void report_present_memory(ID3D12CommandQueue* queue, LONG frame)
+{
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D12Device> device;
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter3> adapter;
+    if (SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) &&
+        SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        const LUID luid = device->GetAdapterLuid();
+        if (FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))) {
+            ComPtr<IDXGIAdapter1> warp;
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))) &&
+                SUCCEEDED(warp->GetDesc1(&desc)) &&
+                desc.AdapterLuid.LowPart == luid.LowPart && desc.AdapterLuid.HighPart == luid.HighPart)
+                warp.As(&adapter);
+        }
+    }
+    char local[48] = "n/a", nonlocal[48] = "n/a";
+    const auto sample = [&](DXGI_MEMORY_SEGMENT_GROUP segment, char (&value)[48]) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+        if (adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(0, segment, &info)))
+            std::snprintf(value, sizeof(value), "%.1f/%.1f", info.CurrentUsage / 1048576.0, info.Budget / 1048576.0);
+    };
+    sample(DXGI_MEMORY_SEGMENT_GROUP_LOCAL, local);
+    sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
+    log("x2w-present-memory frame=%ld process MiB used/budget: local=%s nonlocal=%s", frame, local, nonlocal);
+}
+
+void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG frame)
 {
     static ID3D12CommandAllocator* allocator;
     static ID3D12GraphicsCommandList* list;
@@ -1534,9 +1563,9 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const bool red_dominant = red >= 192 * samples && green <= 32 * samples && blue <= 32 * samples;
     static LONG was_red_dominant;
     const bool was_red = InterlockedExchange(&was_red_dominant, red_dominant) != 0;
-    if (count <= 3 || count % 40 == 0 || (red_dominant && !was_red))
-        log("x2w-render presented %s, mean RGB=(%.2f, %.2f, %.2f)/255", shown_note,
-            red / samples, green / samples, blue / samples);
+    if (count <= 3 || count % 40 == 0 || red_dominant != was_red)
+        log("x2w-render presented %s, mean RGB=(%.2f, %.2f, %.2f)/255 frame=%ld surface=%p", shown_note,
+            red / samples, green / samples, blue / samples, frame, surface);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3582,6 +3611,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     static ULONGLONG started, last_report;
     const LONG frame = InterlockedIncrement(&frames);
     frame_number = frame;
+    if (render_mode() && (frame == 1 || frame % 300 == 0))
+        report_present_memory(static_cast<ID3D12CommandQueue*>(self->own().real), frame);
     draw_dump_flush();
     {
         static const LONG wanted = [] {
@@ -3622,7 +3653,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8)) {
             Wrapper* surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
             if (surface && surface->own().kind == resource_kind && surface->own().real)
-                read_back_presented(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
+                read_back_presented(static_cast<ID3D12CommandQueue*>(self->own().real),
+                                    static_cast<ID3D12Resource*>(surface->own().real), frame);
             else
                 std::snprintf(shown_note, sizeof(shown_note), "presented object %p is not a known resource",
                               *reinterpret_cast<void* const*>(words[2]));
