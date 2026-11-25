@@ -1187,11 +1187,15 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
             const D3D12_INDEX_BUFFER_VIEW view{upload_ring->GetGPUVirtualAddress() + offset, static_cast<UINT>(bytes),
                                                index_bytes == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
             list->IASetIndexBuffer(&view);
+            const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
             list->DrawIndexedInstanced(count, instances ? instances : 1, 0, 0, start_instance);
+            red_producer_draw_after(self, red_samples);
             drawn = true;
         }
     } else {
+        const auto red_samples = red_producer_draw_before(self, list, "translated-draw", tr->key);
         list->DrawInstanced(rect ? count / 3 * 6 : count, instances ? instances : 1, 0, start_instance);
+        red_producer_draw_after(self, red_samples);
         drawn = true;
     }
     if (drawn) draw_dump_after(self, list, tr->key, count);

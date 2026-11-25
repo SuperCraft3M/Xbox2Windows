@@ -1067,6 +1067,7 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12
 }
 
 LONG draw_dump_frame();
+void discard_red_producer(ID3D12GraphicsCommandList* list);
 x2w_startup::DrawReadbacks& draw_dumps()
 {
     static x2w_startup::DrawReadbacks tracker;
@@ -1340,6 +1341,7 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
         reset_viewport_state(self);
         discard_draw_sampler_heaps(previous);
         if (draw_dump_frame()) draw_dumps().discard(previous);
+        discard_red_producer(previous);
     }
     InterlockedIncrement(SUCCEEDED(hr) ? &render_resets : &render_reset_failures);
     static LONG failures;
@@ -1372,6 +1374,7 @@ HRESULT __stdcall list_close(Wrapper* self)
     if (FAILED(hr)) {
         discard_draw_sampler_heaps(list);
         if (draw_dump_frame()) draw_dumps().discard(list);
+        discard_red_producer(list);
         static LONG failures;
         if (first_calls(failures, 6)) log("x2w-render list Close failed 0x%08lx", static_cast<unsigned long>(hr));
     }
@@ -1441,6 +1444,8 @@ void report_present_memory(ID3D12CommandQueue* queue, LONG frame)
     sample(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, nonlocal);
     log("x2w-present-memory frame=%ld process MiB used/budget: local=%s nonlocal=%s", frame, local, nonlocal);
 }
+
+void observe_present_color(LONG frame, ID3D12Resource* surface, const unsigned char* rgba);
 
 void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, LONG frame)
 {
@@ -1555,6 +1560,11 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface, LON
         }
     }
     const D3D12_RANGE none{0, 0};
+    if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        const auto* center = static_cast<const unsigned char*>(mapped) + footprint.Offset +
+                             UINT64{desc.Height / 2} * footprint.Footprint.RowPitch + (desc.Width / 2) * 4;
+        observe_present_color(frame, surface, center);
+    }
     readback->Unmap(0, &none);
     const LONG count = InterlockedIncrement(&shown_frames);
     const double samples = double(shown_width) * shown_height;
@@ -1912,6 +1922,8 @@ struct Pass {
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     UINT target_count = 0;
     ID3D12Resource* target0 = nullptr;  // desktop resource of render target 0 (for per-draw dumps)
+    ID3D12Resource* trace_targets[8]{};
+    ID3D12Resource* trace_depth = nullptr;
     bool heap_set = false;
     x2w_startup::SamplerSource title_samplers;
     std::unique_ptr<x2w_startup::SamplerSnapshot> sampler_snapshot;
@@ -1960,6 +1972,20 @@ D3D12_RESOURCE_STATES sampled_state(Wrapper* self, ID3D12Resource* resource)
     return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 }
 void use_as_target(Wrapper* self, ID3D12Resource* resource) { require_state(self, resource, D3D12_RESOURCE_STATE_RENDER_TARGET); }
+
+#include "startup_stubs/red_producer_diagnostic.inl"
+
+void discard_red_producer(ID3D12GraphicsCommandList* list) { red_producers().discard(list); }
+void observe_present_color(LONG frame, ID3D12Resource* surface, const unsigned char* rgba)
+{
+    auto& tracker = red_producers();
+    if (!tracker.enabled()) return;
+    const bool matched = tracker.matches(rgba);
+    tracker.observe(frame, frame, surface, matched);
+    if (matched || tracker.interested())
+        log("x2w-red sample present=%ld target=%p rgba=%u,%u,%u,%u match=%u",
+            frame, surface, rgba[0], rgba[1], rgba[2], rgba[3], matched);
+}
 void release_targets(Wrapper* self)
 {
     Pass& pass = pass_of(self);
@@ -2248,8 +2274,11 @@ void __stdcall list_clear_target(Wrapper* self, u64 handle, const float* colour,
     }
     auto* list = static_cast<ID3D12GraphicsCommandList*>(self->own().real);
     use_as_target(self, target);
+    auto& tracker = red_producers();
+    const auto red_sample = tracker.before(self, list, target, "clear-rtv", 0, 0);
     list->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(desktop)}, colour, rect_count,
                                 rect_count ? rects : nullptr);
+    tracker.after(self, red_sample);
     InterlockedIncrement(&render_clears);
 }
 // List slot 50 (desktop 46 + 4), OMSetRenderTargets(count, handles, single range, depth).
@@ -2351,6 +2380,10 @@ void __stdcall list_targets(Wrapper* self, UINT count, const D3D12_CPU_DESCRIPTO
         use_as_target(self, targets[i]);
         pass.target_formats[i] = formats[i];
         if (i == 0) pass.target0 = targets[i];
+    }
+    if (red_producers().enabled()) {
+        std::copy_n(targets, 8, pass.trace_targets);
+        pass.trace_depth = dsv_target;
     }
     if (dsv_target) require_state(self, dsv_target, dsv_state);
     pass.target_count = count;
@@ -2475,7 +2508,9 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     }
     // The translated vertex shaders read their fetch table through root parameter 0.
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
+        const auto red_samples = red_producer_draw_before(self, list, "native-draw", 0);
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
+        red_producer_draw_after(self, red_samples);
         const LONG n = InterlockedIncrement(&render_draws);
         if (n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
@@ -2513,12 +2548,14 @@ void __stdcall queue_execute(Wrapper* self, UINT count, void* const* lists)
         if (!ready.empty()) {
             auto* queue = static_cast<ID3D12CommandQueue*>(self->own().real);
             const UINT ready_count = static_cast<UINT>(ready.size());
-            if (draw_dump_frame()) {
-                const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
-                if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
-            } else {
-                queue->ExecuteCommandLists(ready_count, ready.data());
-            }
+            red_producers().execute(queue, ready, [&] {
+                if (draw_dump_frame()) {
+                    const HRESULT hr = draw_dumps().execute(queue, ready_count, ready.data());
+                    if (FAILED(hr)) log("x2w-draw readback fence failed 0x%08lx", static_cast<unsigned long>(hr));
+                } else {
+                    queue->ExecuteCommandLists(ready_count, ready.data());
+                }
+            });
             retire_draw_sampler_heaps(queue, ready);
             note_submits(queue, submitted);
             InterlockedIncrement(&render_executes);
@@ -3614,6 +3651,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     if (render_mode() && (frame == 1 || frame % 300 == 0))
         report_present_memory(static_cast<ID3D12CommandQueue*>(self->own().real), frame);
     draw_dump_flush();
+    red_producers().flush();
     {
         static const LONG wanted = [] {
             char value[16]{};
@@ -3635,6 +3673,8 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         if (planes && words && x2w_local::readable(words, 0x18) && words[1] >= 1 && x2w_local::readable(reinterpret_cast<const void*>(words[2]), 8))
             surface = as_wrapper(*reinterpret_cast<void* const*>(words[2]));
         capture::present(frame, surface);
+        if (surface && surface->own().kind == resource_kind)
+            red_producers().present(static_cast<ID3D12Resource*>(surface->own().real));
         // Render mode: the presented surface goes to the title's window through a swap chain.
         if (render_mode() && surface && surface->own().kind == resource_kind && surface->own().real)
             shown_in_window = present_to_window(static_cast<ID3D12CommandQueue*>(self->own().real), static_cast<ID3D12Resource*>(surface->own().real));
