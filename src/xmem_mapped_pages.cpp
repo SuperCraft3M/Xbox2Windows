@@ -130,7 +130,8 @@ bool map_view(ULONG_PTR address, const Backing& backing)
 
 // Maps bytes of one section at address as a single view; falls back to one view per page when the
 // range is not inside a single placeholder.
-bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes, std::vector<std::pair<ULONG_PTR, SIZE_T>>& made)
+bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
+             std::vector<std::pair<ULONG_PTR, SIZE_T>>& made, ULONG_PTR& failed_address)
 {
     auto* target = reinterpret_cast<void*>(address);
     auto map = [&] {
@@ -143,11 +144,15 @@ bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes, std::vecto
         made.emplace_back(address, bytes);
         return true;
     }
+    failed_address = address;
     if (bytes == page_bytes) return false;
     for (SIZE_T done = 0; done < bytes; done += page_bytes) {
         Backing one = backing;
         one.offset += done;
-        if (!map_view(address + done, one)) return false;
+        if (!map_view(address + done, one)) {
+            failed_address = address + done;
+            return false;
+        }
         memory.runs[address + done] = page_bytes;
         made.emplace_back(address + done, page_bytes);
     }
@@ -356,7 +361,28 @@ void forget_page(ULONG_PTR address)
 // Maps every recorded page of [base, base + size) that has no view: neighbours on adjacent slots
 // together, one page at a time when a group is refused. A page that cannot be mapped is forgotten
 // and counted. fail is true when the test control refuses this range.
-ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail)
+struct MapFailure {
+    const char* stage = nullptr;
+    ULONG_PTR address = 0;
+    ULONG_PTR page = 0;
+    DWORD error = ERROR_SUCCESS;
+    MEMORY_BASIC_INFORMATION region{};
+    SIZE_T view_bytes = page_bytes;
+
+    void record(const char* step, ULONG_PTR at, ULONG_PTR id, DWORD code, SIZE_T bytes = page_bytes) noexcept
+    {
+        if (stage) return;
+        stage = step;
+        address = at;
+        page = id;
+        error = code;
+        view_bytes = bytes;
+        VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region));
+        SetLastError(code);
+    }
+};
+
+ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failure)
 {
     ULONG_PTR lost = 0;
     ULONG_PTR at = base;
@@ -375,7 +401,8 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail)
             if (b.section != head.section || b.offset != head.offset + bytes) break;
         }
         std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
-        if (fail || !map_run(at, head, bytes, made)) {
+        ULONG_PTR failed_address;
+        if (fail || !map_run(at, head, bytes, made, failed_address)) {
             // map_run may have mapped some pages one at a time before it stopped; keep those.
             for (SIZE_T done = 0; done < bytes; done += page_bytes) {
                 if (memory.runs.count(at + done)) continue;
@@ -384,6 +411,9 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail)
                 if (!fail && map_view(at + done, one)) {
                     memory.runs[at + done] = page_bytes;
                 } else {
+                    if (failure)
+                        failure->record("restore-view", at + done, memory.views.at(at + done),
+                                        fail ? ERROR_INVALID_ADDRESS : GetLastError());
                     forget_page(at + done);
                     ++lost;
                 }
@@ -397,30 +427,36 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail)
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
 // are owned by this shim until it unmaps them. The caller must not replace them.
 template <typename AddressAt>
-BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at) noexcept
+BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at,
+                      bool share_views, MapFailure* failure = nullptr) noexcept
 {
     if (!count || count > era_physical::capacity_pages)
         return physical_result(era_physical::Status::invalid);
     try {
-        const bool share_views = fault_retry.ready();
-        const MappingThread marker;
-        const std::lock_guard guard(memory.mutex);
         std::map<ULONG_PTR, ULONG_PTR> batch;
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto address = address_at(i);
             const auto live = memory.views.find(address);
-            if (!address || address % page_bytes ||
-                (tokens ? live != memory.views.end() || !era_physical::owns(tokens[i])
-                        : live == memory.views.end()))
+            const ULONG_PTR page = tokens ? tokens[i] : (live != memory.views.end() ? live->second : 0);
+            const char* invalid = nullptr;
+            if (!address || address % page_bytes) invalid = "invalid-address";
+            else if (tokens && live != memory.views.end()) invalid = "already-mapped";
+            else if (tokens && !era_physical::owns(page)) invalid = "unowned-page";
+            else if (!tokens && live == memory.views.end()) invalid = "unmapped-address";
+            else if (!batch.emplace(address, page).second) invalid = "duplicate-address";
+            if (invalid) {
+                if (failure) failure->record(invalid, address, page, ERROR_INVALID_PARAMETER);
                 return physical_result(era_physical::Status::invalid);
-            if (!batch.emplace(address, tokens ? tokens[i] : live->second).second)
-                return physical_result(era_physical::Status::invalid);
+            }
         }
         // Adjacent pages that are adjacent slots of one section share a single view (a "run"): a
         // multi-gigabyte batch then takes a few views instead of one per 64 KiB page.
         if (tokens) {
             for (const auto& [address, page] : batch) {
-                if (!section_for(page)) return FALSE;
+                if (!section_for(page)) {
+                    if (failure) failure->record("section-backing", address, page, GetLastError());
+                    return FALSE;
+                }
             }
             std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
             auto first = batch.begin();
@@ -432,8 +468,10 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
                     const Backing& b = memory.backings.at(last->second);
                     if (last->first != first->first + bytes || b.section != head.section || b.offset != head.offset + bytes) break;
                 }
-                if (!map_run(first->first, head, bytes, made)) {
+                ULONG_PTR failed_address;
+                if (!map_run(first->first, head, bytes, made, failed_address)) {
                     const DWORD error = GetLastError();
+                    if (failure) failure->record("map-view", failed_address, batch.at(failed_address), error);
                     for (const auto& [base, size] : made) {
                         UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER);
                         memory.runs.erase(base);
@@ -469,12 +507,10 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
             DWORD error = ERROR_SUCCESS;
             std::vector<std::pair<ULONG_PTR, SIZE_T>> unmapped;
             for (const auto& [base, size] : broken) {
-                if (test.hit(1)) {
-                    error = ERROR_INVALID_ADDRESS;
-                    break;
-                }
-                if (!UnmapViewOfFile2(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER)) {
-                    error = GetLastError();
+                const bool inject_failure = test.hit(1);
+                if (inject_failure || !unmap_view(base)) {
+                    error = inject_failure ? ERROR_INVALID_ADDRESS : GetLastError();
+                    if (failure) failure->record("unmap-view", base, memory.views.at(base), error, size);
                     break;
                 }
                 memory.runs.erase(base);
@@ -490,7 +526,7 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
             if (!refused && !unmapped.empty()) hold_window();
             ULONG_PTR lost = 0;
             for (const auto& [base, size] : unmapped)
-                lost += map_recorded(base, size, refused ? test.stage == 3 && test.hit(3) : test.hit(2));
+                lost += map_recorded(base, size, refused ? test.stage == 3 && test.hit(3) : test.hit(2), failure);
             if (!refused) coalesce_unused(batch);
             if (refused || lost) {
                 x2w_local::logf("x2w-xmem unmap of %llu page(s) failed (error %lu): %s; %llu surviving page(s) could not be mapped "
@@ -505,6 +541,15 @@ BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& addres
         return physical_result(era_physical::Status::exhausted);
     }
     return physical_result(era_physical::Status::ok);
+}
+
+template <typename AddressAt>
+BOOL map_pages(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt& address_at) noexcept
+{
+    const bool share_views = fault_retry.ready();
+    const MappingThread marker;
+    const std::lock_guard guard(memory.mutex);
+    return map_pages_locked(count, tokens, address_at, share_views);
 }
 }
 
@@ -573,6 +618,54 @@ void* local_virtual_alloc(void* address, SIZE_T bytes, DWORD type, ULONGLONG att
     return result;
 }
 
+void log_apply_failure(const char* what, const MapFailure& failure, ULONG_PTR count, const ULONG_PTR* addresses)
+{
+    // The apply batch is sorted and the last occurrence of each address wins. Report the caller's
+    // index, including when the failing OS unmap covers a whole run containing a requested page.
+    ULONG_PTR index = count;
+    for (ULONG_PTR i = 0; i < count; ++i) {
+        if (addresses[i] == failure.address) index = i;
+    }
+    if (index == count && failure.view_bytes > page_bytes) {
+        for (ULONG_PTR i = 0; i < count; ++i) {
+            if (addresses[i] - failure.address < failure.view_bytes) {
+                index = i;
+                break;
+            }
+        }
+    }
+    char request_index[24] = "none";
+    if (index != count)
+        std::snprintf(request_index, sizeof(request_index), "%llu", static_cast<unsigned long long>(index));
+    x2w_local::logf("x2w-xmem %s failed stage=%s index=%s address=%p page=0x%llx error=%lu "
+                    "region_base=%p allocation_base=%p region_size=0x%llx state=0x%lx protect=0x%lx type=0x%lx",
+                    what, failure.stage, request_index, reinterpret_cast<void*>(failure.address),
+                    static_cast<unsigned long long>(failure.page), static_cast<unsigned long>(failure.error),
+                    failure.region.BaseAddress, failure.region.AllocationBase,
+                    static_cast<unsigned long long>(failure.region.RegionSize),
+                    static_cast<unsigned long>(failure.region.State), static_cast<unsigned long>(failure.region.Protect),
+                    static_cast<unsigned long>(failure.region.Type));
+}
+
+void log_failed_ranges(const char* what, const char* operation, const std::vector<ULONG_PTR>& addresses)
+{
+    // Addresses are sorted by local_apply. A failed map rolls back its completed views, so all
+    // of its destinations matter when correlating a later fault, even those preceding the error.
+    constexpr std::size_t max_ranges = 2048;
+    std::size_t first = 0;
+    for (std::size_t range = 0; first < addresses.size() && range < max_ranges; ++range) {
+        std::size_t end = first + 1;
+        while (end < addresses.size() && addresses[end] - addresses[end - 1] == page_bytes) ++end;
+        x2w_local::logf("x2w-xmem %s failed batch %s first=%p last=%p pages=%llu", what, operation,
+                        reinterpret_cast<void*>(addresses[first]), reinterpret_cast<void*>(addresses[end - 1]),
+                        static_cast<unsigned long long>(end - first));
+        first = end;
+    }
+    if (first < addresses.size())
+        x2w_local::logf("x2w-xmem %s failed batch %s truncated omitted_pages=%llu", what, operation,
+                        static_cast<unsigned long long>(addresses.size() - first));
+}
+
 // Applies (address, page) pairs; page 0 unmaps. An address that already shows the requested page is
 // left alone; one that shows another page is unmapped first.
 BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* pages, const char* what)
@@ -580,32 +673,46 @@ BOOL local_apply(ULONG_PTR count, const ULONG_PTR* addresses, const ULONG_PTR* p
     std::map<ULONG_PTR, ULONG_PTR> want;
     for (ULONG_PTR i = 0; i < count; ++i) want[addresses[i]] = pages[i];
     std::vector<ULONG_PTR> unmap, map_at, map_page;
-    {
-        const std::lock_guard guard(memory.mutex);
-        for (const auto& [address, page] : want) {
-            const auto live = memory.views.find(address);
-            if (!page) {
-                if (live != memory.views.end()) unmap.push_back(address);
-                continue;
-            }
-            if (live != memory.views.end()) {
-                if (live->second == page) continue;
-                unmap.push_back(address);
-            }
-            map_at.push_back(address);
-            map_page.push_back(page);
-        }
-    }
     BOOL ok = TRUE;
     DWORD error = 0;
-    if (!unmap.empty() && !map_pages(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; })) {
-        ok = FALSE;
-        error = GetLastError();
+    MapFailure failure;
+    {
+        const bool share_views = fault_retry.ready();
+        const MappingThread marker;
+        const std::lock_guard guard(memory.mutex);
+        for (const auto& [address, page] : want) {
+            const char* invalid = nullptr;
+            if (!address || address % page_bytes) invalid = "invalid-address";
+            else if (page && !era_physical::owns(page)) invalid = "unowned-page";
+            if (invalid) {
+                ok = FALSE;
+                error = ERROR_INVALID_PARAMETER;
+                failure.record(invalid, address, page, error);
+                break;
+            }
+            const auto live = memory.views.find(address);
+            if (live != memory.views.end() && live->second == page) continue;
+            if (live != memory.views.end()) unmap.push_back(address);
+            if (page) {
+                map_at.push_back(address);
+                map_page.push_back(page);
+            }
+        }
+        if (ok && !unmap.empty() &&
+            !map_pages_locked(unmap.size(), nullptr, [&](ULONG_PTR i) { return unmap[i]; }, share_views, &failure)) {
+            ok = FALSE;
+            error = GetLastError();
+        }
+        if (ok && !map_at.empty() &&
+            !map_pages_locked(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; }, share_views, &failure)) {
+            ok = FALSE;
+            error = GetLastError();
+        }
     }
-    if (ok && !map_at.empty() &&
-        !map_pages(map_at.size(), map_page.data(), [&](ULONG_PTR i) { return map_at[i]; })) {
-        ok = FALSE;
-        error = GetLastError();
+    if (failure.stage) log_apply_failure(what, failure, count, addresses);
+    if (!ok && x2w_local::env_on("X2W_XMEM_TRACE_FAILED_BATCH")) {
+        log_failed_ranges(what, "map", map_at);
+        log_failed_ranges(what, "unmap", unmap);
     }
     static LONG calls;
     if (!ok || x2w_local::first_calls(calls, 16))
